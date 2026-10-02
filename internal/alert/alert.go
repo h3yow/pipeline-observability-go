@@ -15,6 +15,8 @@ package alert
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/h3yow/pipeline-observability-go/internal/model"
@@ -25,7 +27,25 @@ type Transition struct {
 	Alert     model.Alert
 	FromState model.AlertState
 	ToState   model.AlertState
-	Evidence  string
+	// RunID is the run whose observation caused the transition. It makes
+	// canonical replay (e.g. after backfill) explainable and sortable.
+	RunID    model.RunID
+	Evidence string
+}
+
+// Observation is one determinable run's alert observation, supplied in
+// canonical event-time order for a lifecycle rebuild. Unknown (not
+// determinable) runs must never be observed at all.
+type Observation struct {
+	RunID         model.RunID
+	JobID         model.JobID
+	Kind          model.AlertKind
+	Breach        bool
+	RuleVer       int
+	FireAfterN    int
+	RecoverAfterN int
+	At            int64
+	Evidence      string
 }
 
 type obsResult struct {
@@ -71,6 +91,13 @@ func (m *Manager) Observe(obsID string, jobID model.JobID, kind model.AlertKind,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// obsID is "RunID:Kind" (built by the engine); recover the run id so the
+	// transition records its provenance without changing the public API.
+	runID := model.RunID(obsID)
+	if i := strings.LastIndex(obsID, ":"); i >= 0 {
+		runID = model.RunID(obsID[:i])
+	}
+
 	k := alertKey(jobID, kind)
 	s, ok := m.slots[k]
 	if !ok {
@@ -81,7 +108,7 @@ func (m *Manager) Observe(obsID string, jobID model.JobID, kind model.AlertKind,
 	if prior, seen := s.applied[obsID]; seen {
 		return prior.transition
 	}
-	outcome := m.apply(s, jobID, kind, breach, ruleVer, fireAfterN, recoverAfterN, at, evidence)
+	outcome := m.apply(s, runID, jobID, kind, breach, ruleVer, fireAfterN, recoverAfterN, at, evidence)
 	s.applied[obsID] = obsResult{transition: outcome}
 	return outcome
 }
@@ -93,7 +120,7 @@ func newSlot() *slot {
 // apply performs the state transition for one genuinely new observation.
 // Observations must be delivered in run order; the engine feeds them sorted
 // by event time (out-of-order/late handling happens at intake).
-func (m *Manager) apply(s *slot, jobID model.JobID, kind model.AlertKind, breach bool,
+func (m *Manager) apply(s *slot, runID model.RunID, jobID model.JobID, kind model.AlertKind, breach bool,
 	ruleVer, fireAfterN, recoverAfterN int, at int64, evidence string) *Transition {
 	switch s.state {
 	case model.AlertStateOK:
@@ -107,7 +134,7 @@ func (m *Manager) apply(s *slot, jobID model.JobID, kind model.AlertKind, breach
 		if s.breachRun < fireAfterN {
 			return nil
 		}
-		return m.fire(jobID, kind, s, ruleVer, at, evidence)
+		return m.fire(s, runID, jobID, kind, ruleVer, at, evidence)
 	case model.AlertStateFiring:
 		if breach {
 			// Already firing: repeated breach is a no-op (no duplicate alert).
@@ -118,7 +145,7 @@ func (m *Manager) apply(s *slot, jobID model.JobID, kind model.AlertKind, breach
 		if s.passRun < recoverAfterN {
 			return nil
 		}
-		return m.recover(jobID, kind, s, at, evidence)
+		return m.recover(s, runID, jobID, kind, at, evidence)
 	default:
 		s.state = model.AlertStateOK
 		s.breachRun, s.passRun = 0, 0
@@ -126,8 +153,8 @@ func (m *Manager) apply(s *slot, jobID model.JobID, kind model.AlertKind, breach
 	}
 }
 
-func (m *Manager) fire(jobID model.JobID, kind model.AlertKind,
-	s *slot, ruleVer int, at int64, evidence string) *Transition {
+func (m *Manager) fire(s *slot, runID model.RunID, jobID model.JobID, kind model.AlertKind,
+	ruleVer int, at int64, evidence string) *Transition {
 	m.seq++
 	al := model.Alert{
 		JobID:     jobID,
@@ -142,6 +169,7 @@ func (m *Manager) fire(jobID model.JobID, kind model.AlertKind,
 		Alert:     al,
 		FromState: model.AlertStateOK,
 		ToState:   model.AlertStateFiring,
+		RunID:     runID,
 		Evidence:  evidence,
 	}
 	s.state = model.AlertStateFiring
@@ -151,8 +179,8 @@ func (m *Manager) fire(jobID model.JobID, kind model.AlertKind,
 	return &tr
 }
 
-func (m *Manager) recover(jobID model.JobID, kind model.AlertKind,
-	s *slot, at int64, evidence string) *Transition {
+func (m *Manager) recover(s *slot, runID model.RunID, jobID model.JobID, kind model.AlertKind,
+	at int64, evidence string) *Transition {
 	m.seq++
 	al := model.Alert{
 		JobID:   jobID,
@@ -168,6 +196,7 @@ func (m *Manager) recover(jobID model.JobID, kind model.AlertKind,
 		Alert:     al,
 		FromState: model.AlertStateFiring,
 		ToState:   model.AlertStateRecover,
+		RunID:     runID,
 		Evidence:  evidence,
 	}
 	m.events = append(m.events, tr)
@@ -176,6 +205,92 @@ func (m *Manager) recover(jobID model.JobID, kind model.AlertKind,
 	s.breachRun, s.passRun = 0, 0
 	s.firedSeq = 0
 	return &tr
+}
+
+// Rebuild replaces the alert lifecycle of the kinds appearing in obs with a
+// fresh fold over the supplied observations, which must already be in
+// canonical order (At, then RunID, then Kind). Every other kind keeps its
+// state. Afterwards the complete transition log is re-sorted canonically and
+// re-sequenced, so the global AlertEvents() history is byte-identical to the
+// history a manager would hold had every observation — including ones
+// recovered by backfill — arrived in normal event-time order. It returns the
+// transitions that now exist for the rebuilt kinds (in canonical order).
+func (m *Manager) Rebuild(obs []Observation) []Transition {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	kinds := map[string]bool{}
+	for _, o := range obs {
+		kinds[alertKey(o.JobID, o.Kind)] = true
+	}
+
+	// Drop the old slots and log entries for the rebuilt kinds.
+	kept := make([]Transition, 0, len(m.events))
+	for _, tr := range m.events {
+		if !kinds[alertKey(tr.Alert.JobID, tr.Alert.Kind)] {
+			kept = append(kept, tr)
+		}
+	}
+	for k := range kinds {
+		delete(m.slots, k)
+	}
+
+	var rebuilt []Transition
+	for _, o := range obs {
+		k := alertKey(o.JobID, o.Kind)
+		s, ok := m.slots[k]
+		if !ok {
+			s = newSlot()
+			m.slots[k] = s
+		}
+		obsID := string(o.RunID) + ":" + string(o.Kind)
+		if tr := m.apply(s, o.RunID, o.JobID, o.Kind, o.Breach,
+			o.RuleVer, o.FireAfterN, o.RecoverAfterN, o.At, o.Evidence); tr != nil {
+			s.applied[obsID] = obsResult{transition: tr}
+			rebuilt = append(rebuilt, *tr)
+		} else {
+			s.applied[obsID] = obsResult{}
+		}
+	}
+
+	// Canonical global log: observation event time, then run, then kind.
+	all := kept
+	all = append(all, rebuilt...)
+	sort.SliceStable(all, func(i, j int) bool {
+		ti, tj := all[i].Alert.Timestamp.UnixNano(), all[j].Alert.Timestamp.UnixNano()
+		if ti != tj {
+			return ti < tj
+		}
+		if ri, rj := string(all[i].RunID), string(all[j].RunID); ri != rj {
+			return ri < rj
+		}
+		return string(all[i].Alert.Kind) < string(all[j].Alert.Kind)
+	})
+	// Re-sequence in canonical order so histories compare across paths, and
+	// rewrite each RECOVERED reason to point at the global seq of the FIRING
+	// it recovers (its fold-local seq may differ from the global position).
+	lastFiring := map[string]int64{}
+	for i := range all {
+		all[i].Alert.Seq = int64(i + 1)
+		key := alertKey(all[i].Alert.JobID, all[i].Alert.Kind)
+		switch all[i].ToState {
+		case model.AlertStateFiring:
+			lastFiring[key] = all[i].Alert.Seq
+		case model.AlertStateRecover:
+			if fs, ok := lastFiring[key]; ok {
+				// Preserve the fold-produced wording (incl. the pass-run
+				// count) so canonical histories are textually identical to
+				// the incremental path; only retarget the firing seq, whose
+				// global position may differ from the fold-local one.
+				if prefix, _, ok := strings.Cut(all[i].Alert.Reason, "firing alert seq="); ok {
+					all[i].Alert.Reason = prefix + fmt.Sprintf("firing alert seq=%d", fs)
+				}
+			}
+		}
+	}
+	m.seq = int64(len(all))
+	m.events = all
+	return rebuilt
 }
 
 // State returns the current lifecycle state of one alert.

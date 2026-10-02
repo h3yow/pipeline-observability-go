@@ -9,6 +9,16 @@
 //     is the same regardless of arrival order or concurrency scheduling.
 //   - Already-applied state is never overwritten: duplicates return the
 //     original receipt, conflicting same-phase events are rejected.
+//
+// Missing-basis support:
+//   - Rejected STARTED candidates are recorded per run as gap evidence, so a
+//     finished run without a started event explains whether the start is
+//     still missing, was dropped (invalid/late) or was displaced by another
+//     delivery. PendingRuns lists such runs for backfill triage.
+//   - Backfill injects a recovered event bypassing only the lateness window;
+//     every other rule (validation, dedup, no-overwrite) still applies and
+//     the aggregate is rebuilt canonically, making the repaired run
+//     indistinguishable from one whose event was never lost.
 package ingest
 
 import (
@@ -16,6 +26,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/h3yow/pipeline-observability-go/internal/event"
 	"github.com/h3yow/pipeline-observability-go/internal/model"
@@ -38,6 +49,11 @@ const (
 	DispositionOutOfOrder Disposition = "OUT_OF_ORDER_BUFFERED"
 	// DispositionApplied: event applied immediately to the run aggregate.
 	DispositionApplied Disposition = "APPLIED"
+	// DispositionBackfilled: event explicitly injected via Backfill
+	// (archive/manual recovery), bypassing the lateness window; the
+	// aggregate is rebuilt canonically so the result is identical to an
+	// event that was never lost.
+	DispositionBackfilled Disposition = "BACKFILLED"
 )
 
 // Receipt is the per-event intake result.
@@ -50,6 +66,26 @@ type Receipt struct {
 	// AppliedSeq is the monotonic intake sequence when the event was
 	// applied (including delayed application); zero when not applied.
 	AppliedSeq int64
+}
+
+// rejectedEvent is a candidate event that could not fill a run phase. It
+// explains why a later gap exists (dropped / displaced) instead of the gap
+// looking like "nothing ever arrived".
+type rejectedEvent struct {
+	eventID    string
+	occurredNs int64 // zero when the envelope failed to decode
+	code       model.GapCode
+	detail     string
+}
+
+// PendingRun is one finished run whose time basis is incomplete and which
+// therefore cannot be judged; it is one row of the "to be backfilled" view.
+type PendingRun struct {
+	RunID      string
+	JobID      string
+	FinishedAt time.Time
+	AppliedSeq int64
+	Gap        model.MissingBasis
 }
 
 type seenRecord struct {
@@ -81,6 +117,9 @@ type Store struct {
 
 	seen map[string]seenRecord
 	runs map[string]*runAgg
+	// rejected lists rejected STARTED candidates per run that may explain a
+	// missing start. It is the evidence behind GapDropped*/GapDisplaced.
+	rejected map[string][]rejectedEvent
 }
 
 // NewStore creates an intake store with the given event-time lateness
@@ -91,6 +130,35 @@ func NewStore(allowLateness int64) *Store {
 		allowLateness: allowLateness,
 		seen:          map[string]seenRecord{},
 		runs:          map[string]*runAgg{},
+		rejected:      map[string][]rejectedEvent{},
+	}
+}
+
+// addRejectedLocked records one rejected STARTED candidate as gap evidence
+// for a run. Candidates with the same EventID are kept once (the original
+// decision), so repeated invalid deliveries cannot grow the evidence list.
+func (s *Store) addRejectedLocked(runID string, r rejectedEvent) {
+	for _, ex := range s.rejected[runID] {
+		if ex.eventID == r.eventID {
+			return
+		}
+	}
+	s.rejected[runID] = append(s.rejected[runID], r)
+}
+
+// removeRejectedLocked drops a rejected candidate (used when an event once
+// dropped as LATE is successfully recovered via Backfill), so stale evidence
+// cannot keep classifying a run whose basis is now complete.
+func (s *Store) removeRejectedLocked(runID, eventID string) {
+	rs := s.rejected[runID]
+	for i, r := range rs {
+		if r.eventID == eventID {
+			s.rejected[runID] = append(rs[:i], rs[i+1:]...)
+			if len(s.rejected[runID]) == 0 {
+				delete(s.rejected, runID)
+			}
+			return
+		}
 	}
 }
 
@@ -101,9 +169,38 @@ func NewStore(allowLateness int64) *Store {
 func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.processLocked(env, false)
+}
 
+// Backfill explicitly injects one recovered event (e.g. restored from an
+// archive or by manual repair). It is identical to Ingest except that the
+// lateness window is bypassed: a recovered started event that the window
+// would reject can still fill the missing phase. All other rules still
+// apply (validation, duplicate idempotency, no overwrite of an occupied
+// phase), and the aggregate is rebuilt canonically, so the repaired run is
+// indistinguishable from one whose event arrived normally in order.
+//
+// Safe for concurrent use.
+func (s *Store) Backfill(_ context.Context, env event.Envelope) Receipt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.processLocked(env, true)
+}
+
+// processLocked implements the common intake/backfill decision. The two
+// paths differ only in whether the watermark may reject the event.
+func (s *Store) processLocked(env event.Envelope, backfill bool) Receipt {
 	dec, err := env.Validate()
 	if err != nil {
+		// Only a candidate for the STARTED phase can explain a start gap;
+		// a malformed finished event must not pollute the evidence.
+		if env.RunID != "" && env.Type == event.TypeStarted {
+			s.addRejectedLocked(env.RunID, rejectedEvent{
+				eventID: env.EventID,
+				code:    model.GapDroppedInvalid,
+				detail:  fmt.Sprintf("candidate %s rejected: %s", env.EventID, err.Error()),
+			})
+		}
 		return Receipt{
 			EventID:     env.EventID,
 			RunID:       env.RunID,
@@ -114,31 +211,54 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 	}
 
 	// 1) Duplicate delivery: return the ORIGINAL decision, never re-apply.
+	//    The single exception is an event previously dropped as LATE that is
+	//    now explicitly recovered via Backfill: the operator is asserting the
+	//    event is genuine, so it is given a second chance (everything else,
+	//    incl. validation and no-overwrite, is still enforced below).
 	if rec, ok := s.seen[dec.EventID]; ok {
-		return Receipt{
-			EventID:     dec.EventID,
-			RunID:       dec.RunID,
-			Accepted:    false,
-			Disposition: DispositionDuplicate,
-			Reason: fmt.Sprintf("duplicate delivery of %s (first seen as %s, seq=%d)",
-				dec.EventID, rec.disp, rec.seq),
+		if backfill && rec.disp == DispositionLate {
+			delete(s.seen, dec.EventID)
+			s.removeRejectedLocked(dec.RunID, dec.EventID)
+		} else {
+			return Receipt{
+				EventID:     dec.EventID,
+				RunID:       dec.RunID,
+				Accepted:    false,
+				Disposition: DispositionDuplicate,
+				Reason: fmt.Sprintf("duplicate delivery of %s (first seen as %s, seq=%d)",
+					dec.EventID, rec.disp, rec.seq),
+			}
 		}
 	}
 
 	occurredNs := dec.OccurredAt.UnixNano()
 
-	// 2) Watermark / lateness check (before any state is touched).
-	wm := s.watermarkLocked()
-	if occurredNs < wm {
-		s.seen[dec.EventID] = seenRecord{disp: DispositionLate}
-		return Receipt{
-			EventID:     dec.EventID,
-			RunID:       dec.RunID,
-			Accepted:    false,
-			Disposition: DispositionLate,
-			Reason: fmt.Sprintf("event time %s older than watermark %s (maxOccurred-lateness)",
-				dec.OccurredAt.UTC().Format("15:04:05.000"),
-				unixNsToTime(wm).Format("15:04:05.000")),
+	// 2) Watermark / lateness check (before any state is touched). Backfill
+	//    deliberately bypasses it: the event is explicitly recovered.
+	if !backfill {
+		wm := s.watermarkLocked()
+		if occurredNs < wm {
+			s.seen[dec.EventID] = seenRecord{disp: DispositionLate}
+			if dec.Type == event.TypeStarted {
+				s.addRejectedLocked(dec.RunID, rejectedEvent{
+					eventID:    dec.EventID,
+					occurredNs: occurredNs,
+					code:       model.GapDroppedLate,
+					detail: fmt.Sprintf("candidate %s dropped by watermark: event time %s older than %s",
+						dec.EventID,
+						dec.OccurredAt.UTC().Format("15:04:05.000"),
+						unixNsToTime(wm).Format("15:04:05.000")),
+				})
+			}
+			return Receipt{
+				EventID:     dec.EventID,
+				RunID:       dec.RunID,
+				Accepted:    false,
+				Disposition: DispositionLate,
+				Reason: fmt.Sprintf("event time %s older than watermark %s (maxOccurred-lateness)",
+					dec.OccurredAt.UTC().Format("15:04:05.000"),
+					unixNsToTime(wm).Format("15:04:05.000")),
+			}
 		}
 	}
 
@@ -152,13 +272,23 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 		s.runs[dec.RunID] = agg
 	} else if agg.jobID != dec.JobID {
 		// A run id must never belong to two jobs.
+		detail := fmt.Sprintf("run %s already belongs to job %s, event claims %s",
+			dec.RunID, agg.jobID, dec.JobID)
 		s.seen[dec.EventID] = seenRecord{disp: DispositionConflict}
+		if dec.Type == event.TypeStarted {
+			s.addRejectedLocked(dec.RunID, rejectedEvent{
+				eventID:    dec.EventID,
+				occurredNs: occurredNs,
+				code:       model.GapDisplaced,
+				detail:     fmt.Sprintf("candidate %s displaced: %s", dec.EventID, detail),
+			})
+		}
 		return Receipt{
 			EventID:     dec.EventID,
 			RunID:       dec.RunID,
 			Accepted:    false,
 			Disposition: DispositionConflict,
-			Reason:      fmt.Sprintf("run %s already belongs to job %s, event claims %s", dec.RunID, agg.jobID, dec.JobID),
+			Reason:      detail,
 		}
 	}
 
@@ -166,6 +296,14 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 	//    applied state wins; the newcomer is rejected, nothing overwritten.
 	if reason := phaseConflictLocked(agg, dec); reason != "" {
 		s.seen[dec.EventID] = seenRecord{disp: DispositionConflict}
+		if dec.Type == event.TypeStarted {
+			s.addRejectedLocked(dec.RunID, rejectedEvent{
+				eventID:    dec.EventID,
+				occurredNs: occurredNs,
+				code:       model.GapDisplaced,
+				detail:     "candidate displaced: " + reason,
+			})
+		}
 		return Receipt{
 			EventID:     dec.EventID,
 			RunID:       dec.RunID,
@@ -192,18 +330,28 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 	s.seq++
 	seq := s.seq
 	agg.events[dec.EventID] = acceptedEvent{ev: dec, seq: seq}
-	s.seen[dec.EventID] = seenRecord{
-		disp: DispositionApplied,
-		seq:  seq,
+	seenDisp := DispositionApplied
+	if backfill {
+		seenDisp = DispositionBackfilled
 	}
+	s.seen[dec.EventID] = seenRecord{disp: seenDisp, seq: seq}
 	if occurredNs > s.maxOccurredNs {
 		s.maxOccurredNs = occurredNs
 	}
 	agg.rebuild()
+	agg.state.BasisGap = s.gapForLocked(agg)
 
 	disp := DispositionApplied
 	reason := fmt.Sprintf("applied in event-time order (seq=%d)", seq)
-	if outOfOrder {
+	switch {
+	case backfill && outOfOrder:
+		disp = DispositionBackfilled
+		reason = fmt.Sprintf("explicit backfill arrived after later event %s; aggregate rebuilt in event-time order (seq=%d)",
+			laterEvent, seq)
+	case backfill:
+		disp = DispositionBackfilled
+		reason = fmt.Sprintf("explicit backfill bypassed the lateness window; aggregate rebuilt canonically (seq=%d)", seq)
+	case outOfOrder:
 		disp = DispositionOutOfOrder
 		reason = fmt.Sprintf("arrived after later event %s; buffered and aggregate rebuilt in event-time order (seq=%d)",
 			laterEvent, seq)
@@ -215,6 +363,49 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 		Disposition: disp,
 		Reason:      reason,
 		AppliedSeq:  seq,
+	}
+}
+
+// gapForLocked derives the missing-basis explanation for a finished run that
+// has no started event. It returns nil when the basis is complete. The
+// explanation is a pure function of the accepted/rejected input set: the
+// strongest evidence wins (DISPLACED > DROPPED_LATE > DROPPED_INVALID),
+// ties broken by earliest event time then EventID; with no evidence the
+// started event has simply not been observed yet.
+func (s *Store) gapForLocked(agg *runAgg) *model.MissingBasis {
+	if !agg.state.HasFinished || agg.state.HasStarted {
+		return nil
+	}
+	rank := map[model.GapCode]int{
+		model.GapDroppedInvalid: 1,
+		model.GapDroppedLate:    2,
+		model.GapDisplaced:      3,
+	}
+	var best *rejectedEvent
+	for i := range s.rejected[agg.runID] {
+		r := &s.rejected[agg.runID][i]
+		if best == nil ||
+			rank[r.code] > rank[best.code] ||
+			(rank[r.code] == rank[best.code] &&
+				(r.occurredNs < best.occurredNs ||
+					(r.occurredNs == best.occurredNs && r.eventID < best.eventID))) {
+			best = r
+		}
+	}
+	if best == nil {
+		return &model.MissingBasis{
+			Phase: model.PhaseStarted,
+			Code:  model.GapNotArrived,
+			Detail: fmt.Sprintf(
+				"run %s has a finished event but no run.started event has been observed; it may still arrive or be backfilled",
+				agg.runID),
+		}
+	}
+	return &model.MissingBasis{
+		Phase:           model.PhaseStarted,
+		Code:            best.code,
+		Detail:          best.detail,
+		EvidenceEventID: best.eventID,
 	}
 }
 
@@ -239,6 +430,13 @@ func phaseConflictLocked(agg *runAgg, dec *event.DecodedEvent) string {
 	return ""
 }
 
+// snapshotLocked returns a copy of a run aggregate's state with its current
+// missing-basis explanation attached.
+func (s *Store) snapshotLocked(agg *runAgg) model.RunState {
+	agg.state.BasisGap = s.gapForLocked(agg)
+	return agg.state
+}
+
 // Run returns the current aggregated state of one run.
 func (s *Store) Run(runID string) (model.RunState, bool) {
 	s.mu.Lock()
@@ -247,7 +445,7 @@ func (s *Store) Run(runID string) (model.RunState, bool) {
 	if !ok {
 		return model.RunState{}, false
 	}
-	return agg.state, true
+	return s.snapshotLocked(agg), true
 }
 
 // Runs returns a snapshot of all aggregated runs ordered by RunID.
@@ -261,7 +459,7 @@ func (s *Store) Runs() []model.RunState {
 	sort.Strings(ids)
 	out := make([]model.RunState, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, s.runs[id].state)
+		out = append(out, s.snapshotLocked(s.runs[id]))
 	}
 	return out
 }
@@ -274,6 +472,50 @@ func (s *Store) CompleteRuns() []model.RunState {
 		if r.IsComplete() {
 			out = append(out, r)
 		}
+	}
+	return out
+}
+
+// PendingRuns returns the "to be backfilled" view: finished runs whose time
+// basis is incomplete (no started event), ordered by RunID. Because it is
+// derived from the canonical aggregates plus the rejected-candidate index,
+// its set and reasons are stable under out-of-order, duplicate and
+// concurrent delivery.
+func (s *Store) PendingRuns() []PendingRun {
+	return s.PendingRunsPage("", 0)
+}
+
+// PendingRunsPage returns one deterministic page of the pending view: rows
+// with RunID strictly greater than cursor, at most limit rows (limit <= 0
+// means all), ordered by RunID. Use the last row's RunID as the next
+// cursor to scroll large sets without any view over state changes.
+func (s *Store) PendingRunsPage(cursor string, limit int) []PendingRun {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.runs))
+	for id, agg := range s.runs {
+		if id > cursor && agg.state.IsComplete() && !agg.state.HasStarted {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if limit > 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	out := make([]PendingRun, 0, len(ids))
+	for _, id := range ids {
+		agg := s.runs[id]
+		gap := s.gapForLocked(agg)
+		if gap == nil {
+			continue
+		}
+		out = append(out, PendingRun{
+			RunID:      id,
+			JobID:      agg.jobID,
+			FinishedAt: agg.state.FinishedAt,
+			AppliedSeq: agg.state.AppliedSeq,
+			Gap:        *gap,
+		})
 	}
 	return out
 }

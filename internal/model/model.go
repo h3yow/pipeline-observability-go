@@ -45,6 +45,11 @@ type RunState struct {
 	AppliedSeq int64
 	// AppliedEventIDs lists the event ids that contributed, in apply order.
 	AppliedEventIDs []string
+	// BasisGap explains the missing time basis when the run is finished but
+	// lacks a started event. Empty means the basis is complete or the run
+	// has not finished yet. Populated by the intake layer from its rejected
+	// candidate index, so the reason is a pure function of the input set.
+	BasisGap *MissingBasis
 }
 
 // Duration returns the run duration; zero when the run is not finished.
