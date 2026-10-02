@@ -103,3 +103,53 @@ func TestEvaluateVersionedReproducibility(t *testing.T) {
 	t.Logf("decision basis: explicit version binding => v1 replay stays pass while v2 fails; RuleVer recorded=%d/%d",
 		c1.RuleVer, c2.RuleVer)
 }
+
+// TestEvaluateUnknownWhenBasisMissing: a run with only a finished event
+// must not be judged pass/fail; both verdicts are UNKNOWN and no breach
+// is raised.
+func TestEvaluateUnknownWhenBasisMissing(t *testing.T) {
+	e := NewEvaluator()
+	r := model.RunState{
+		RunID: "r-lost", JobID: "job-a",
+		FinishedAt:  at(20),
+		Result:      model.ResultSuccess,
+		HasFinished: true, // HasStarted == false: start event lost
+	}
+	c := e.Evaluate(r, rules(10*time.Minute, 10*time.Minute))
+	t.Logf("INPUT run=%s hasStarted=false hasFinished=true finish=%s", r.RunID, at(20).Format("15:04:05"))
+	t.Logf("DECISION determinable=%v gaps=%v | FRESHNESS %s | SLA %s",
+		c.Determinable, c.Gaps, c.Freshness.Reason, c.SLA.Reason)
+
+	if c.Determinable {
+		t.Fatal("run without start basis must be indeterminable")
+	}
+	if c.Freshness.Status != model.StatusUnknown || c.SLA.Status != model.StatusUnknown {
+		t.Fatalf("both verdicts must be UNKNOWN, got %s/%s", c.Freshness.Status, c.SLA.Status)
+	}
+	if c.Freshness.OK || c.SLA.OK {
+		t.Fatal("UNKNOWN must not be reported as OK")
+	}
+	if len(c.Breaches) != 0 {
+		t.Fatalf("UNKNOWN must raise no breaches, got %v", c.Breaches)
+	}
+	if len(c.Gaps) != 1 || c.Gaps[0].EventType != "run.started" {
+		t.Fatalf("gap must name the missing run.started input, got %+v", c.Gaps)
+	}
+	t.Logf("decision basis: incomplete time basis => UNKNOWN, no breach, gap=%s", c.Gaps[0].EventType)
+}
+
+// TestEvaluateDeterminableStatusMirrorsOK: for complete runs the new
+// Status field agrees with the legacy OK flag.
+func TestEvaluateDeterminableStatusMirrorsOK(t *testing.T) {
+	e := NewEvaluator()
+	pass := e.Evaluate(runState(0, 5, model.ResultSuccess), rules(30*time.Minute, 10*time.Minute))
+	breach := e.Evaluate(runState(0, 20, model.ResultSuccess), rules(30*time.Minute, 10*time.Minute))
+	t.Logf("INPUT duration=5m => %s | INPUT duration=20m => %s", pass.SLA.Reason, breach.SLA.Reason)
+	if !pass.Determinable || pass.SLA.Status != model.StatusPass || !pass.SLA.OK {
+		t.Fatalf("pass run: status=%s ok=%v", pass.SLA.Status, pass.SLA.OK)
+	}
+	if breach.SLA.Status != model.StatusBreach || breach.SLA.OK {
+		t.Fatalf("breach run: status=%s ok=%v", breach.SLA.Status, breach.SLA.OK)
+	}
+	t.Logf("decision basis: Status mirrors OK for determinable runs (PASS/BREACH)")
+}

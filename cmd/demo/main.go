@@ -89,4 +89,55 @@ func main() {
 		fmt.Printf("ALERT job=%s kind=%s %s -> %s seq=%d reason=%s\n",
 			tr.Alert.JobID, tr.Alert.Kind, tr.FromState, tr.ToState, tr.Alert.Seq, tr.Alert.Reason)
 	}
+
+	// ---- missing-basis scenario -------------------------------------
+	// run-5's started event is lost upstream: only its finish arrives.
+	fmt.Println("\n== missing start event: unknown conclusion & backfill ==")
+	e2 := engine.New(int64(6 * time.Hour))
+	if err := e2.Rules().Register(rule.Set{
+		RuleID: "job-b", Version: 1,
+		FreshnessDeadline: 30 * time.Minute, SLADuration: 10 * time.Minute,
+		FireAfterN: 1, RecoverAfterN: 1,
+	}); err != nil {
+		panic(err)
+	}
+	rec := e2.IngestEvent(context.Background(),
+		finished("g-f5", at(24, 9, 15), "run-5", "job-b", "FAILED"))
+	fmt.Printf("INGEST event=g-f5 run=run-5 -> %s %s\n", rec.Disposition, rec.Reason)
+
+	unknown, trs, err := e2.Evaluate()
+	if err != nil {
+		panic(err)
+	}
+	for _, c := range unknown {
+		fmt.Printf("RUN %s determinable=%v\n  freshness %s\n  sla       %s\n  gaps      %+v\n",
+			c.RunID, c.Determinable, c.Freshness.Reason, c.SLA.Reason, c.Gaps)
+	}
+	fmt.Printf("alerts raised by unknown run: %d (must be 0)\n", len(trs))
+
+	pending, cursor, _ := e2.PendingRuns("", 10)
+	fmt.Printf("\n-- pending view (cursor=%q) --\n", cursor)
+	for _, p := range pending {
+		fmt.Printf("PENDING run=%s job=%s finished=%s\n  gap: %s cause=%s (%s)\n",
+			p.RunID, p.JobID, p.FinishedAt.Format("15:04"), p.Gaps[0].EventType, p.Gaps[0].Cause, p.Gaps[0].Detail)
+	}
+
+	// The lost event is recovered from an archive and explicitly backfilled.
+	rec = e2.BackfillEvent(context.Background(),
+		started("g-s5", at(24, 9, 0), "run-5", "job-b"))
+	fmt.Printf("\nBACKFILL event=g-s5 run=run-5 -> %s %s\n", rec.Disposition, rec.Reason)
+	resolved, trs, err := e2.Evaluate()
+	if err != nil {
+		panic(err)
+	}
+	for _, c := range resolved {
+		fmt.Printf("RUN %s determinable=%v\n  freshness %s\n  sla       %s\n",
+			c.RunID, c.Determinable, c.Freshness.Reason, c.SLA.Reason)
+	}
+	for _, tr := range trs {
+		fmt.Printf("ALERT job=%s kind=%s %s -> %s seq=%d reason=%s\n",
+			tr.Alert.JobID, tr.Alert.Kind, tr.FromState, tr.ToState, tr.Alert.Seq, tr.Alert.Reason)
+	}
+	pending, _, _ = e2.PendingRuns("", 10)
+	fmt.Printf("pending after backfill: %d (must be 0)\n", len(pending))
 }

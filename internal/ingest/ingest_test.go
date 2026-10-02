@@ -215,3 +215,134 @@ func TestIngestConcurrentDeterministic(t *testing.T) {
 	}
 	t.Logf("decision basis: mutex-serialized intake + canonical rebuild; stable snapshot=%s", first)
 }
+
+// TestBackfillAfterLateDrop: a started event dropped by the watermark can
+// be explicitly backfilled; the aggregate then equals the never-lost state.
+func TestBackfillAfterLateDrop(t *testing.T) {
+	s := NewStore(int64(time.Minute)) // 1m lateness window
+	// finished arrives first and advances the watermark far beyond the start.
+	fin := finished("bf-fin", ts(30), "rB", "SUCCESS")
+	sta := started("bf-sta", ts(0), "rB")
+	logReceipt(t, fin, s.Ingest(context.Background(), fin))
+	rLate := s.Ingest(context.Background(), sta)
+	logReceipt(t, sta, rLate)
+	if rLate.Disposition != DispositionLate {
+		t.Fatalf("start must be dropped LATE, got %s", rLate.Disposition)
+	}
+
+	// The rejection is explainable via RejectedFor.
+	rej := s.RejectedFor("rB")
+	if len(rej) != 1 || rej[0].Disposition != DispositionLate || rej[0].EventID != "bf-sta" {
+		t.Fatalf("rejection record wrong: %+v", rej)
+	}
+	t.Logf("gap evidence: %+v", rej[0])
+
+	// Explicit backfill accepts the same envelope despite the watermark.
+	rb := s.Backfill(context.Background(), sta)
+	logReceipt(t, sta, rb)
+	if !rb.Accepted || rb.Disposition != DispositionBackfilled {
+		t.Fatalf("backfill must be accepted as BACKFILLED, got %+v", rb)
+	}
+	run, _ := s.Run("rB")
+	if !run.IsComplete() || run.StartedAt != ts(0) || run.Duration() != 30*time.Minute {
+		t.Fatalf("aggregate after backfill wrong: %+v", run)
+	}
+	if rej := s.RejectedFor("rB"); len(rej) != 0 {
+		t.Fatalf("rejection record must be cleared after backfill, got %+v", rej)
+	}
+	t.Logf("decision basis: backfill bypasses watermark; canonical rebuild gives started=%s duration=%s",
+		run.StartedAt.Format("15:04:05"), run.Duration())
+
+	// Duplicate backfill is idempotent: original receipt replayed, no state change.
+	rb2 := s.Backfill(context.Background(), sta)
+	logReceipt(t, sta, rb2)
+	if rb2.Disposition != DispositionDuplicate || rb2.Accepted {
+		t.Fatalf("duplicate backfill must be DUPLICATE, got %+v", rb2)
+	}
+	run2, _ := s.Run("rB")
+	if run2.AppliedSeq != run.AppliedSeq || len(run2.AppliedEventIDs) != 2 {
+		t.Fatalf("duplicate backfill changed state: %+v", run2)
+	}
+	// Normal ingest of the same event is also a duplicate now.
+	r3 := s.Ingest(context.Background(), sta)
+	if r3.Disposition != DispositionDuplicate {
+		t.Fatalf("ingest after backfill must be DUPLICATE, got %s", r3.Disposition)
+	}
+}
+
+// TestBackfillNeverSeen: backfilling an event that never arrived simply
+// accepts it (watermark untouched).
+func TestBackfillNeverSeen(t *testing.T) {
+	s := NewStore(int64(time.Minute))
+	fin := finished("n1", ts(10), "rN", "SUCCESS")
+	s.Ingest(context.Background(), fin)
+	sta := started("n0", ts(0), "rN")
+	r := s.Backfill(context.Background(), sta)
+	logReceipt(t, sta, r)
+	if !r.Accepted || r.Disposition != DispositionBackfilled {
+		t.Fatalf("want BACKFILLED, got %+v", r)
+	}
+	// Watermark must not move backwards/forwards because of historical data:
+	// an event slightly older than the finish but newer than the start is
+	// still judged against the original watermark.
+	run, _ := s.Run("rN")
+	if run.Duration() != 10*time.Minute {
+		t.Fatalf("duration = %v, want 10m", run.Duration())
+	}
+	t.Logf("decision basis: backfill accepted without advancing watermark; duration=%s", run.Duration())
+}
+
+// TestBackfillConflictRejected: backfilling a second started event for a
+// run that already has one is still a conflict — nothing is overwritten.
+func TestBackfillConflictRejected(t *testing.T) {
+	s := NewStore(int64(time.Hour))
+	a := started("c1", ts(0), "rC")
+	s.Ingest(context.Background(), a)
+	b := started("c2", ts(5), "rC") // different id, same phase
+	r := s.Backfill(context.Background(), b)
+	logReceipt(t, b, r)
+	if r.Accepted || r.Disposition != DispositionConflict {
+		t.Fatalf("backfill of conflicting phase must be CONFLICT, got %+v", r)
+	}
+	run, _ := s.Run("rC")
+	if run.StartedAt != ts(0) {
+		t.Fatalf("existing state must win, startedAt=%s", run.StartedAt.Format("15:04:05"))
+	}
+	t.Logf("decision basis: phase conflict still enforced for backfill; startedAt preserved")
+}
+
+// TestBackfillConcurrentIdempotent: many goroutines backfilling the same
+// event produce exactly one acceptance and a stable aggregate.
+func TestBackfillConcurrentIdempotent(t *testing.T) {
+	s := NewStore(int64(time.Minute))
+	fin := finished("x-fin", ts(30), "rX", "SUCCESS")
+	s.Ingest(context.Background(), fin)
+	sta := started("x-sta", ts(0), "rX")
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	counts := map[string]int{}
+	start := make(chan struct{})
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r := s.Backfill(context.Background(), sta)
+			mu.Lock()
+			counts[string(r.Disposition)]++
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	t.Logf("concurrent backfill dispositions: %v", counts)
+	if counts["BACKFILLED"] != 1 || counts["DUPLICATE"] != 15 {
+		t.Fatalf("exactly one backfill must apply, got %v", counts)
+	}
+	run, _ := s.Run("rX")
+	if !run.IsComplete() || len(run.AppliedEventIDs) != 2 {
+		t.Fatalf("aggregate must contain each event once: %+v", run)
+	}
+	t.Logf("decision basis: mutex-serialized backfill; aggregate=%v", run.AppliedEventIDs)
+}

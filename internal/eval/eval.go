@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/h3yow/pipeline-observability-go/internal/event"
 	"github.com/h3yow/pipeline-observability-go/internal/model"
 	"github.com/h3yow/pipeline-observability-go/internal/rule"
 )
@@ -31,18 +32,29 @@ func NewEvaluator() *Evaluator {
 // Evaluate judges one completed run under an explicit rule version.
 // The caller is responsible for resolving the exact rule version; passing
 // a versioned Set makes historical replay identical to the original run.
+//
+// When the run's time basis is incomplete (no started event applied), the
+// conclusion is marked indeterminable: both verdicts are UNKNOWN, no breach
+// is raised, and Conclusion.Gaps names the missing input. The gap's Cause
+// is left for the caller (the engine enriches it from intake records).
 func (e *Evaluator) Evaluate(run model.RunState, rs rule.Set) model.Conclusion {
 	c := model.Conclusion{
-		JobID:       run.JobID,
-		RunID:       run.RunID,
-		RuleID:      rs.RuleID,
-		RuleVer:     rs.Version,
-		EvaluatedAt: e.now(),
+		JobID:        run.JobID,
+		RunID:        run.RunID,
+		RuleID:       rs.RuleID,
+		RuleVer:      rs.Version,
+		EvaluatedAt:  e.now(),
+		Determinable: true,
+	}
+
+	if !run.HasStarted || !run.HasFinished {
+		return e.undeterminable(run, c, rs)
 	}
 
 	expectedBy := run.StartedAt.Add(rs.FreshnessDeadline)
 	fresh := !run.FinishedAt.After(expectedBy) // FinishedAt <= ExpectedBy
 	c.Freshness = model.FreshnessVerdict{
+		Status:         statusOf(fresh),
 		OK:             fresh,
 		ExpectedBy:     expectedBy,
 		ActualFinishAt: run.FinishedAt,
@@ -60,6 +72,7 @@ func (e *Evaluator) Evaluate(run model.RunState, rs rule.Set) model.Conclusion {
 	dur := run.Duration()
 	okSLA := dur <= rs.SLADuration
 	c.SLA = model.SLAVerdict{
+		Status: statusOf(okSLA),
 		OK:     okSLA,
 		Limit:  rs.SLADuration,
 		Actual: dur,
@@ -73,6 +86,44 @@ func (e *Evaluator) Evaluate(run model.RunState, rs rule.Set) model.Conclusion {
 	}
 
 	return c
+}
+
+// undeterminable builds an UNKNOWN conclusion for a run whose time basis is
+// incomplete. It never raises a breach.
+func (e *Evaluator) undeterminable(run model.RunState, c model.Conclusion, rs rule.Set) model.Conclusion {
+	c.Determinable = false
+	if !run.HasStarted {
+		c.Gaps = append(c.Gaps, model.InputGap{
+			EventType: string(event.TypeStarted),
+			Detail:    "no run.started event applied to this run",
+		})
+	}
+	if !run.HasFinished {
+		c.Gaps = append(c.Gaps, model.InputGap{
+			EventType: string(event.TypeFinished),
+			Detail:    "no run.finished event applied to this run",
+		})
+	}
+	basis := fmt.Sprintf("started=%v finished=%v", run.HasStarted, run.HasFinished)
+	c.Freshness = model.FreshnessVerdict{
+		Status:         model.StatusUnknown,
+		ActualFinishAt: run.FinishedAt,
+		Reason: fmt.Sprintf("UNKNOWN: incomplete time basis (%s); freshness not judgable (rule %s v%d)",
+			basis, rs.RuleID, rs.Version),
+	}
+	c.SLA = model.SLAVerdict{
+		Status: model.StatusUnknown,
+		Reason: fmt.Sprintf("UNKNOWN: incomplete time basis (%s); duration not judgable (rule %s v%d)",
+			basis, rs.RuleID, rs.Version),
+	}
+	return c
+}
+
+func statusOf(ok bool) model.VerdictStatus {
+	if ok {
+		return model.StatusPass
+	}
+	return model.StatusBreach
 }
 
 func verdict(ok bool, pass, fail string) string {

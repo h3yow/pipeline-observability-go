@@ -139,3 +139,105 @@ func TestObserveConcurrentIndependentKeys(t *testing.T) {
 	}
 	t.Logf("decision basis: 10 jobs x 2 kinds, each fired exactly once: %d events", len(m.Events()))
 }
+
+// TestRecomputeMatchesIncremental: replaying the canonical observation
+// list via Recompute yields the same lifecycle as incremental Observe,
+// and replays never re-emit transitions.
+func TestRecomputeMatchesIncremental(t *testing.T) {
+	// Observations: breach, breach (fire at 2), pass (recover), breach (refire).
+	mk := func() []Observation {
+		return []Observation{
+			{ObsID: "run-1:SLA", Breach: true, RuleVer: 1, FireAfterN: 2, RecoverAfterN: 1, At: 100, Evidence: "run-1 breach"},
+			{ObsID: "run-2:SLA", Breach: true, RuleVer: 1, FireAfterN: 2, RecoverAfterN: 1, At: 200, Evidence: "run-2 breach"},
+			{ObsID: "run-3:SLA", Breach: false, RuleVer: 1, FireAfterN: 2, RecoverAfterN: 1, At: 300, Evidence: "run-3 pass"},
+			{ObsID: "run-4:SLA", Breach: true, RuleVer: 1, FireAfterN: 2, RecoverAfterN: 1, At: 400, Evidence: "run-4 breach"},
+		}
+	}
+
+	inc := NewManager()
+	for _, o := range mk() {
+		tr := inc.Observe(o.ObsID, "job-r", model.KindSLA, o.Breach, o.RuleVer, o.FireAfterN, o.RecoverAfterN, o.At, o.Evidence)
+		if tr != nil {
+			t.Logf("INCREMENTAL obs=%s => %s->%s seq=%d", o.ObsID, tr.FromState, tr.ToState, tr.Alert.Seq)
+		}
+	}
+
+	rec := NewManager()
+	var all []Transition
+	// Feed the observations incrementally as growing prefixes, as the
+	// engine does: each new run triggers a full canonical replay.
+	obs := mk()
+	for i := 1; i <= len(obs); i++ {
+		newOnes := rec.Recompute("job-r", model.KindSLA, obs[:i])
+		for _, tr := range newOnes {
+			t.Logf("RECOMPUTE prefix=%d => %s->%s seq=%d reason=%q", i, tr.FromState, tr.ToState, tr.Alert.Seq, tr.Alert.Reason)
+		}
+		all = append(all, newOnes...)
+	}
+
+	incEvents := inc.Events()
+	if len(all) != len(incEvents) {
+		t.Fatalf("recompute emitted %d transitions, incremental emitted %d", len(all), len(incEvents))
+	}
+	for i := range all {
+		a, b := all[i], incEvents[i]
+		if a.ToState != b.ToState || a.FromState != b.FromState ||
+			a.Alert.Reason != b.Alert.Reason || a.Evidence != b.Evidence ||
+			a.Alert.Timestamp != b.Alert.Timestamp {
+			t.Fatalf("transition %d differs:\nrecompute:   %+v\nincremental: %+v", i, a, b)
+		}
+	}
+	// Replaying the same prefix again emits nothing.
+	if again := rec.Recompute("job-r", model.KindSLA, obs); len(again) != 0 {
+		t.Fatalf("idempotent replay must emit nothing, got %d", len(again))
+	}
+	st, _ := rec.State("job-r", model.KindSLA)
+	stInc, _ := inc.State("job-r", model.KindSLA)
+	if st != stInc {
+		t.Fatalf("final state differs: recompute=%s incremental=%s", st, stInc)
+	}
+	t.Logf("decision basis: %d transitions identical between replay and incremental feed; final state=%s", len(all), st)
+}
+
+// TestRecomputeInsertBackfilledObservation: an observation inserted into
+// its canonical position afterwards (backfill) produces the transitions
+// the in-order history would have produced, without duplicating emitted
+// ones.
+func TestRecomputeInsertBackfilledObservation(t *testing.T) {
+	m := NewManager()
+	obs := func(id string, breach bool, at int64) Observation {
+		return Observation{ObsID: id, Breach: breach, RuleVer: 1, FireAfterN: 2, RecoverAfterN: 1, At: at, Evidence: "ev " + id}
+	}
+	// run-2 is pending (unknown) at first: only run-1, run-3 observed.
+	first := m.Recompute("job-bf", model.KindSLA, []Observation{
+		obs("run-1:SLA", true, 100),
+		obs("run-3:SLA", false, 300),
+	})
+	t.Logf("before backfill: %d transitions", len(first))
+	if len(first) != 0 {
+		t.Fatalf("single breach then pass must not fire, got %v", first)
+	}
+	// Backfill resolves run-2 (a breach) into its canonical position.
+	second := m.Recompute("job-bf", model.KindSLA, []Observation{
+		obs("run-1:SLA", true, 100),
+		obs("run-2:SLA", true, 200),
+		obs("run-3:SLA", false, 300),
+	})
+	for _, tr := range second {
+		t.Logf("after backfill => %s->%s seq=%d reason=%q", tr.FromState, tr.ToState, tr.Alert.Seq, tr.Alert.Reason)
+	}
+	// Canonical history breach,breach,pass => FIRE at run-2, RECOVER at run-3.
+	if len(second) != 2 || second[0].ToState != model.AlertStateFiring || second[1].ToState != model.AlertStateRecover {
+		t.Fatalf("backfilled replay must fire then recover, got %+v", second)
+	}
+	if second[1].Alert.Reason == "" || second[0].Alert.Seq == second[1].Alert.Seq {
+		t.Fatal("transitions must have distinct seqs")
+	}
+	// A third identical replay emits nothing.
+	if third := m.Recompute("job-bf", model.KindSLA, []Observation{
+		obs("run-1:SLA", true, 100), obs("run-2:SLA", true, 200), obs("run-3:SLA", false, 300),
+	}); len(third) != 0 {
+		t.Fatalf("replay must be idempotent, got %d new transitions", len(third))
+	}
+	t.Logf("decision basis: canonical replay after backfill emits exactly FIRE+RECOVER once")
+}

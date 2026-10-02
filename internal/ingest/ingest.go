@@ -38,6 +38,9 @@ const (
 	DispositionOutOfOrder Disposition = "OUT_OF_ORDER_BUFFERED"
 	// DispositionApplied: event applied immediately to the run aggregate.
 	DispositionApplied Disposition = "APPLIED"
+	// DispositionBackfilled: event explicitly backfilled (operator action);
+	// accepted into its run bypassing the lateness watermark.
+	DispositionBackfilled Disposition = "BACKFILLED"
 )
 
 // Receipt is the per-event intake result.
@@ -55,6 +58,15 @@ type Receipt struct {
 type seenRecord struct {
 	disp Disposition
 	seq  int64
+}
+
+// RejectedEvent records one event that intake refused, kept per run so the
+// cause of a missing input (late, invalid, superseded) stays explainable.
+type RejectedEvent struct {
+	EventID     string
+	Type        event.Type
+	Disposition Disposition
+	Reason      string
 }
 
 type acceptedEvent struct {
@@ -81,6 +93,9 @@ type Store struct {
 
 	seen map[string]seenRecord
 	runs map[string]*runAgg
+	// rejected indexes refused events by run id (INVALID/LATE/CONFLICT),
+	// so a run with a missing input can explain WHY it is missing.
+	rejected map[string][]RejectedEvent
 }
 
 // NewStore creates an intake store with the given event-time lateness
@@ -91,6 +106,34 @@ func NewStore(allowLateness int64) *Store {
 		allowLateness: allowLateness,
 		seen:          map[string]seenRecord{},
 		runs:          map[string]*runAgg{},
+		rejected:      map[string][]RejectedEvent{},
+	}
+}
+
+// recordRejectedLocked notes a refused event against its run (when the run
+// id is known). Duplicate deliveries are not recorded: they are replays of
+// an already-decided event, not independent gaps.
+func (s *Store) recordRejectedLocked(runID string, typ event.Type, eventID string, disp Disposition, reason string) {
+	if runID == "" {
+		return
+	}
+	s.rejected[runID] = append(s.rejected[runID], RejectedEvent{
+		EventID: eventID, Type: typ, Disposition: disp, Reason: reason,
+	})
+}
+
+// forgetRejectedLocked drops the rejection record for eventID (used when an
+// explicit backfill later accepts an event that was previously refused).
+func (s *Store) forgetRejectedLocked(runID, eventID string) {
+	recs := s.rejected[runID]
+	for i, r := range recs {
+		if r.EventID == eventID {
+			s.rejected[runID] = append(recs[:i], recs[i+1:]...)
+			break
+		}
+	}
+	if len(s.rejected[runID]) == 0 {
+		delete(s.rejected, runID)
 	}
 }
 
@@ -104,6 +147,7 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 
 	dec, err := env.Validate()
 	if err != nil {
+		s.recordRejectedLocked(env.RunID, env.Type, env.EventID, DispositionInvalid, err.Error())
 		return Receipt{
 			EventID:     env.EventID,
 			RunID:       env.RunID,
@@ -131,14 +175,16 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 	wm := s.watermarkLocked()
 	if occurredNs < wm {
 		s.seen[dec.EventID] = seenRecord{disp: DispositionLate}
+		reason := fmt.Sprintf("event time %s older than watermark %s (maxOccurred-lateness)",
+			dec.OccurredAt.UTC().Format("15:04:05.000"),
+			unixNsToTime(wm).Format("15:04:05.000"))
+		s.recordRejectedLocked(dec.RunID, dec.Type, dec.EventID, DispositionLate, reason)
 		return Receipt{
 			EventID:     dec.EventID,
 			RunID:       dec.RunID,
 			Accepted:    false,
 			Disposition: DispositionLate,
-			Reason: fmt.Sprintf("event time %s older than watermark %s (maxOccurred-lateness)",
-				dec.OccurredAt.UTC().Format("15:04:05.000"),
-				unixNsToTime(wm).Format("15:04:05.000")),
+			Reason:      reason,
 		}
 	}
 
@@ -153,12 +199,14 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 	} else if agg.jobID != dec.JobID {
 		// A run id must never belong to two jobs.
 		s.seen[dec.EventID] = seenRecord{disp: DispositionConflict}
+		reason := fmt.Sprintf("run %s already belongs to job %s, event claims %s", dec.RunID, agg.jobID, dec.JobID)
+		s.recordRejectedLocked(dec.RunID, dec.Type, dec.EventID, DispositionConflict, reason)
 		return Receipt{
 			EventID:     dec.EventID,
 			RunID:       dec.RunID,
 			Accepted:    false,
 			Disposition: DispositionConflict,
-			Reason:      fmt.Sprintf("run %s already belongs to job %s, event claims %s", dec.RunID, agg.jobID, dec.JobID),
+			Reason:      reason,
 		}
 	}
 
@@ -166,6 +214,7 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 	//    applied state wins; the newcomer is rejected, nothing overwritten.
 	if reason := phaseConflictLocked(agg, dec); reason != "" {
 		s.seen[dec.EventID] = seenRecord{disp: DispositionConflict}
+		s.recordRejectedLocked(dec.RunID, dec.Type, dec.EventID, DispositionConflict, reason)
 		return Receipt{
 			EventID:     dec.EventID,
 			RunID:       dec.RunID,
@@ -216,6 +265,127 @@ func (s *Store) Ingest(_ context.Context, env event.Envelope) Receipt {
 		Reason:      reason,
 		AppliedSeq:  seq,
 	}
+}
+
+// Backfill explicitly inserts a historically missing event into its run
+// (operator action, e.g. recovered from an archive). Unlike Ingest it
+// bypasses the lateness watermark — the caller vouches for the event — and
+// it may accept an event that was previously rejected as LATE.
+//
+// Guarantees:
+//   - Validation still applies: undecodable envelopes stay INVALID.
+//   - Same-phase conflicts still apply: a run that already has an event for
+//     that phase keeps it; the backfill is rejected, nothing overwritten.
+//   - Idempotent: backfilling an already-accepted EventID returns the
+//     original receipt as DUPLICATE and changes nothing.
+//   - The aggregate is rebuilt canonically, so the result equals the state
+//     in which the event had never been lost.
+//   - Backfilled events do NOT advance the watermark: historical data must
+//     not reopen lateness windows for other runs.
+func (s *Store) Backfill(_ context.Context, env event.Envelope) Receipt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dec, err := env.Validate()
+	if err != nil {
+		s.recordRejectedLocked(env.RunID, env.Type, env.EventID, DispositionInvalid, err.Error())
+		return Receipt{
+			EventID:     env.EventID,
+			RunID:       env.RunID,
+			Accepted:    false,
+			Disposition: DispositionInvalid,
+			Reason:      err.Error(),
+		}
+	}
+
+	if rec, ok := s.seen[dec.EventID]; ok {
+		switch rec.disp {
+		case DispositionLate, DispositionConflict:
+			// Explicit backfill may override these refusals; re-attempt below.
+		default:
+			// Already accepted (APPLIED / OUT_OF_ORDER_BUFFERED / BACKFILLED):
+			// replay the original decision, never re-apply.
+			return Receipt{
+				EventID:     dec.EventID,
+				RunID:       dec.RunID,
+				Accepted:    false,
+				Disposition: DispositionDuplicate,
+				Reason: fmt.Sprintf("duplicate backfill of %s (first seen as %s, seq=%d)",
+					dec.EventID, rec.disp, rec.seq),
+			}
+		}
+	}
+
+	agg, ok := s.runs[dec.RunID]
+	if !ok {
+		agg = &runAgg{
+			runID:  dec.RunID,
+			jobID:  dec.JobID,
+			events: map[string]acceptedEvent{},
+		}
+		s.runs[dec.RunID] = agg
+	} else if agg.jobID != dec.JobID {
+		s.seen[dec.EventID] = seenRecord{disp: DispositionConflict}
+		reason := fmt.Sprintf("run %s already belongs to job %s, event claims %s", dec.RunID, agg.jobID, dec.JobID)
+		s.recordRejectedLocked(dec.RunID, dec.Type, dec.EventID, DispositionConflict, reason)
+		return Receipt{
+			EventID:     dec.EventID,
+			RunID:       dec.RunID,
+			Accepted:    false,
+			Disposition: DispositionConflict,
+			Reason:      reason,
+		}
+	}
+
+	// Same-phase conflict is still enforced for backfills: existing applied
+	// state wins, nothing is overwritten.
+	if reason := phaseConflictLocked(agg, dec); reason != "" {
+		s.seen[dec.EventID] = seenRecord{disp: DispositionConflict}
+		s.recordRejectedLocked(dec.RunID, dec.Type, dec.EventID, DispositionConflict, reason)
+		return Receipt{
+			EventID:     dec.EventID,
+			RunID:       dec.RunID,
+			Accepted:    false,
+			Disposition: DispositionConflict,
+			Reason:      reason,
+		}
+	}
+
+	// Accept: allocate sequence, store, rebuild canonically. The watermark
+	// (maxOccurredNs) is deliberately left untouched.
+	s.seq++
+	seq := s.seq
+	agg.events[dec.EventID] = acceptedEvent{ev: dec, seq: seq}
+	s.seen[dec.EventID] = seenRecord{disp: DispositionBackfilled, seq: seq}
+	s.forgetRejectedLocked(dec.RunID, dec.EventID)
+	agg.rebuild()
+
+	return Receipt{
+		EventID:     dec.EventID,
+		RunID:       dec.RunID,
+		Accepted:    true,
+		Disposition: DispositionBackfilled,
+		Reason: fmt.Sprintf("explicitly backfilled into run %s; aggregate rebuilt in event-time order (seq=%d)",
+			dec.RunID, seq),
+		AppliedSeq: seq,
+	}
+}
+
+// RejectedFor returns the refused events recorded for a run, ordered by
+// (Type, EventID) for a stable, deterministic view.
+func (s *Store) RejectedFor(runID string) []RejectedEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs := s.rejected[runID]
+	out := make([]RejectedEvent, len(recs))
+	copy(out, recs)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Type != out[j].Type {
+			return out[i].Type < out[j].Type
+		}
+		return out[i].EventID < out[j].EventID
+	})
+	return out
 }
 
 // watermarkLocked returns maxOccurred - allowLateness (unix nanoseconds).
