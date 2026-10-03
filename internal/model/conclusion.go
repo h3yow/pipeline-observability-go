@@ -32,7 +32,11 @@ type Alert struct {
 	Version   int
 	Reason    string
 	Timestamp time.Time
-	Seq       int64
+	// Seq is the 1-based position of this transition within its
+	// (JobID, Kind) canonical alert history. It is stable while the
+	// canonical history only grows; a backfill that rewrites the history
+	// renumbers it to match the never-lost, in-order path exactly.
+	Seq int64
 }
 
 // VerdictStatus is the ternary outcome of one judgement.

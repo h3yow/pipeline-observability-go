@@ -11,10 +11,24 @@
 // passes that do not meet the recovery threshold are absorbed, so flapping
 // near the boundary cannot generate duplicate alerts. Recovery and a later
 // re-fire are distinct, separately sequenced alerts.
+//
+// Canonical history & backfill:
+//
+// Each (jobID, kind) slot owns a CANONICAL alert history: the exact
+// transition sequence the canonically ordered observations produce.
+// Alert.Seq is the 1-based position of a transition within its slot's
+// history (not a global counter). Recompute replays the complete
+// observation list and REBUILDS the slot history to match it:
+// transitions the replay no longer produces (e.g. a backfilled pass that
+// breaks a breach streak, or a firing point that moved) are removed, and
+// seqs are renumbered to canonical positions. The rebuilt history is
+// therefore identical — count, order, seqs and the fire a recovery refers
+// to — to the history the never-lost, in-order path would have produced.
 package alert
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/h3yow/pipeline-observability-go/internal/model"
@@ -32,6 +46,14 @@ type obsResult struct {
 	transition *Transition
 }
 
+// historyEntry is one canonical transition together with its identity key
+// (target state + triggering observation). The key is what replays match
+// against to decide whether a transition is genuinely new.
+type historyEntry struct {
+	key string
+	tr  Transition
+}
+
 type slot struct {
 	state        model.AlertState
 	breachRun    int // consecutive breaches while OK
@@ -41,18 +63,15 @@ type slot struct {
 	// applied deduplicates re-delivered observations (e.g. same runID fed
 	// twice); the original outcome is returned instead of re-applied.
 	applied map[string]obsResult
-	// emitted records transitions already emitted for this slot, keyed by
-	// (toState, triggering observation) and valued by the assigned seq.
-	// Replays (Recompute) never emit the same lifecycle transition twice.
-	emitted map[string]int64
+	// history is the slot's canonical alert history in emission order.
+	// Each entry's Alert.Seq equals its 1-based position in this slice.
+	history []historyEntry
 }
 
 // Manager owns per (job, kind) alert lifecycle state.
 type Manager struct {
-	mu     sync.Mutex
-	seq    int64
-	slots  map[string]*slot
-	events []Transition
+	mu    sync.Mutex
+	slots map[string]*slot
 }
 
 // NewManager creates an alert Manager.
@@ -62,6 +81,14 @@ func NewManager() *Manager {
 
 func alertKey(jobID model.JobID, kind model.AlertKind) string {
 	return string(jobID) + "|" + string(kind)
+}
+
+// transitionKey is the identity of a lifecycle transition: its target
+// state plus the observation that triggered it. Two replays that produce
+// the same key refer to the same alert; a replay that drops a key has
+// invalidated the corresponding alert.
+func transitionKey(toState model.AlertState, triggerObsID string) string {
+	return string(toState) + "|" + triggerObsID
 }
 
 // Observe feeds one breach/pass observation for a (job, kind) pair.
@@ -75,23 +102,19 @@ func (m *Manager) Observe(obsID string, jobID model.JobID, kind model.AlertKind,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	k := alertKey(jobID, kind)
-	s, ok := m.slots[k]
-	if !ok {
-		s = newSlot()
-		m.slots[k] = s
-	}
+	s := m.slotLocked(jobID, kind)
 	// Idempotent re-delivery: return the original outcome, do not advance.
 	if prior, seen := s.applied[obsID]; seen {
 		return prior.transition
 	}
 	var outcome *Transition
 	if tr := m.apply(s, jobID, kind, breach, ruleVer, fireAfterN, recoverAfterN, at, evidence); tr != nil {
-		emitted, _ := m.emitLocked(s, *tr, obsID)
-		if emitted.ToState == model.AlertStateFiring {
-			s.firedSeq = emitted.Alert.Seq
+		tr.Alert.Seq = int64(len(s.history)) + 1
+		if tr.ToState == model.AlertStateFiring {
+			s.firedSeq = tr.Alert.Seq
 		}
-		outcome = &emitted
+		s.history = append(s.history, historyEntry{key: transitionKey(tr.ToState, obsID), tr: *tr})
+		outcome = tr
 	}
 	s.applied[obsID] = obsResult{transition: outcome}
 	return outcome
@@ -109,77 +132,75 @@ type Observation struct {
 }
 
 // Recompute resets the (job, kind) slot and replays the given observations
-// as the complete, canonically ordered history. Transitions already emitted
-// (in this or earlier calls) are not emitted again; only genuinely new
-// transitions are returned and appended to the event log.
+// as the complete, canonically ordered history, then REBUILDS the slot's
+// alert history to exactly what the replay produced:
 //
-// This is how the engine incorporates backfilled runs: inserting the
-// resolved run into its canonical position and replaying yields exactly
-// the alert lifecycle that in-order delivery would have produced, without
-// duplicating alerts that already went out.
+//   - transitions already present (same target state + triggering
+//     observation) are kept and are NOT returned again;
+//   - transitions the replay no longer produces are removed from the
+//     history — a backfill can move the firing point earlier/later or
+//     invalidate a firing entirely, and the stale alert must not linger;
+//   - seqs are renumbered to canonical 1-based positions, so the rebuilt
+//     history equals the never-lost, in-order history entry by entry
+//     (including the fire seq a recovery refers to).
+//
+// The return value holds only the genuinely new transitions (those whose
+// identity was not in the previous history).
 func (m *Manager) Recompute(jobID model.JobID, kind model.AlertKind, obs []Observation) []Transition {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	k := alertKey(jobID, kind)
-	s, ok := m.slots[k]
-	if !ok {
-		s = newSlot()
-		m.slots[k] = s
+	s := m.slotLocked(jobID, kind)
+	prev := make(map[string]bool, len(s.history))
+	for _, e := range s.history {
+		prev[e.key] = true
 	}
-	// Reset runtime state; emitted/applied survive so replays stay
-	// idempotent and cross-references (firedSeq) are re-established below.
+
+	// Reset runtime state; the history is rebuilt below. Cross-references
+	// (firedSeq) are re-established in canonical order as we replay.
 	s.state = model.AlertStateOK
 	s.breachRun, s.passRun = 0, 0
 	s.firedVersion, s.firedSeq = 0, 0
 
-	var out []Transition
+	var canon []historyEntry
+	var newOnes []Transition
 	for _, o := range obs {
 		tr := m.apply(s, jobID, kind, o.Breach, o.RuleVer, o.FireAfterN, o.RecoverAfterN, o.At, o.Evidence)
 		if tr == nil {
 			continue
 		}
-		emitted, isNew := m.emitLocked(s, *tr, o.ObsID)
-		if emitted.ToState == model.AlertStateFiring {
-			s.firedSeq = emitted.Alert.Seq
+		tr.Alert.Seq = int64(len(canon)) + 1
+		if tr.ToState == model.AlertStateFiring {
+			s.firedSeq = tr.Alert.Seq
 		}
-		if isNew {
-			out = append(out, emitted)
+		key := transitionKey(tr.ToState, o.ObsID)
+		canon = append(canon, historyEntry{key: key, tr: *tr})
+		if !prev[key] {
+			newOnes = append(newOnes, *tr)
 		}
 	}
-	return out
+	s.history = canon
+	return newOnes
 }
 
-func newSlot() *slot {
-	return &slot{state: model.AlertStateOK, applied: map[string]obsResult{}, emitted: map[string]int64{}}
-}
-
-// emitLocked resolves the transition's identity (toState + triggering
-// observation): if this slot already emitted it, the original seq is
-// reused and the second return value is false; otherwise a new seq is
-// assigned and the transition is appended to the event log. This makes
-// replays safe: a recomputed history never duplicates an emitted alert.
-func (m *Manager) emitLocked(s *slot, tr Transition, triggerObsID string) (Transition, bool) {
-	key := string(tr.ToState) + "|" + triggerObsID
-	if seq, ok := s.emitted[key]; ok {
-		tr.Alert.Seq = seq
-		return tr, false
+func (m *Manager) slotLocked(jobID model.JobID, kind model.AlertKind) *slot {
+	k := alertKey(jobID, kind)
+	s, ok := m.slots[k]
+	if !ok {
+		s = &slot{state: model.AlertStateOK, applied: map[string]obsResult{}}
+		m.slots[k] = s
 	}
-	m.seq++
-	s.emitted[key] = m.seq
-	tr.Alert.Seq = m.seq
-	m.events = append(m.events, tr)
-	return tr, true
+	return s
 }
 
 // apply performs the state transition for one genuinely new observation.
 // Observations must be delivered in run order; the engine feeds them sorted
 // by event time (out-of-order/late handling happens at intake).
 //
-// apply is pure with respect to the event log: it only advances the slot
+// apply is pure with respect to the history: it only advances the slot
 // state machine and returns the transition (if any) without a sequence
-// number. Emission (seq assignment, log append, replay dedupe) happens in
-// emitLocked, so both Observe and Recompute share one state machine.
+// number. Sequencing and history bookkeeping happen in the callers
+// (Observe / Recompute), so both share one state machine.
 func (m *Manager) apply(s *slot, jobID model.JobID, kind model.AlertKind, breach bool,
 	ruleVer, fireAfterN, recoverAfterN int, at int64, evidence string) *Transition {
 	switch s.state {
@@ -269,12 +290,24 @@ func (m *Manager) State(jobID model.JobID, kind model.AlertKind) (model.AlertSta
 	return s.state, true
 }
 
-// Events returns all emitted lifecycle transitions in emission order.
+// Events returns the canonical alert history of every slot. Slots are
+// ordered by their (jobID|kind) key so the result is deterministic even
+// when slots were created concurrently; within a slot, entries are in
+// canonical emission order (Alert.Seq is the 1-based position).
 func (m *Manager) Events() []Transition {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]Transition, len(m.events))
-	copy(out, m.events)
+	keys := make([]string, 0, len(m.slots))
+	for k := range m.slots {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []Transition
+	for _, k := range keys {
+		for _, e := range m.slots[k].history {
+			out = append(out, e.tr)
+		}
+	}
 	return out
 }
 

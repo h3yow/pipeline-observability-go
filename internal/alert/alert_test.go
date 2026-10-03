@@ -2,6 +2,7 @@ package alert
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -240,4 +241,82 @@ func TestRecomputeInsertBackfilledObservation(t *testing.T) {
 		t.Fatalf("replay must be idempotent, got %d new transitions", len(third))
 	}
 	t.Logf("decision basis: canonical replay after backfill emits exactly FIRE+RECOVER once")
+}
+
+// TestRecomputeRewritesSupersededHistory: when a backfilled observation
+// changes the canonical history, Recompute must REBUILD the slot history
+// — a firing that the new canonical replay no longer produces (moved or
+// invalidated) is removed, never duplicated, and seqs are renumbered to
+// match the never-lost path.
+func TestRecomputeRewritesSupersededHistory(t *testing.T) {
+	obs := func(id string, breach bool, at int64) Observation {
+		return Observation{ObsID: id, Breach: breach, RuleVer: 1, FireAfterN: 2, RecoverAfterN: 1, At: at, Evidence: "ev " + id}
+	}
+
+	// 1) Firing point moves earlier: breach,breach fires at run-3 first;
+	//    a backfilled breach at run-2 (earlier At) takes over the firing.
+	m := NewManager()
+	first := m.Recompute("job-rw", model.KindSLA, []Observation{
+		obs("run-1:SLA", true, 100),
+		obs("run-3:SLA", true, 300),
+		obs("run-4:SLA", false, 400),
+	})
+	t.Logf("before backfill: %d transitions (fire at run-3, recover at run-4)", len(first))
+	if len(first) != 2 {
+		t.Fatalf("want FIRE+RECOVER before backfill, got %v", first)
+	}
+	second := m.Recompute("job-rw", model.KindSLA, []Observation{
+		obs("run-1:SLA", true, 100),
+		obs("run-2:SLA", true, 200), // backfilled: canonical firing point
+		obs("run-3:SLA", true, 300),
+		obs("run-4:SLA", false, 400),
+	})
+	for _, tr := range second {
+		t.Logf("after backfill => NEW %s->%s seq=%d reason=%q", tr.FromState, tr.ToState, tr.Alert.Seq, tr.Alert.Reason)
+	}
+	// Only the moved firing is new; the recovery (same trigger run-4) is kept.
+	if len(second) != 1 || second[0].ToState != model.AlertStateFiring {
+		t.Fatalf("only the moved firing must be new, got %+v", second)
+	}
+	hist := m.Events()
+	if len(hist) != 2 || hist[0].ToState != model.AlertStateFiring || hist[1].ToState != model.AlertStateRecover {
+		t.Fatalf("history must be exactly FIRE+RECOVER, got %+v", hist)
+	}
+	if hist[0].Alert.Seq != 1 || hist[1].Alert.Seq != 2 {
+		t.Fatalf("seqs must be renumbered to canonical positions 1,2; got %d,%d",
+			hist[0].Alert.Seq, hist[1].Alert.Seq)
+	}
+	if hist[0].Alert.Timestamp.UnixNano() != 200 {
+		t.Fatalf("firing must be stamped at the backfilled run-2 (At=200), got %d", hist[0].Alert.Timestamp.UnixNano())
+	}
+	// The recovery must reference the (single) firing it resolves.
+	if want := "firing alert seq=1"; !strings.Contains(hist[1].Alert.Reason, want) {
+		t.Fatalf("recovery must reference firing seq=1, reason=%q", hist[1].Alert.Reason)
+	}
+
+	// 2) Firing invalidated: a backfilled pass breaks the breach streak;
+	//    the whole FIRE+RECOVER history must disappear.
+	m2 := NewManager()
+	m2.Recompute("job-rw2", model.KindSLA, []Observation{
+		obs("run-1:SLA", true, 100),
+		obs("run-2:SLA", true, 200),
+	})
+	if got := len(m2.Events()); got != 1 {
+		t.Fatalf("want one firing before invalidation, got %d", got)
+	}
+	newOnes := m2.Recompute("job-rw2", model.KindSLA, []Observation{
+		obs("run-1:SLA", true, 100),
+		obs("run-m:SLA", false, 150), // backfilled pass resets the debounce
+		obs("run-2:SLA", true, 200),
+	})
+	if len(newOnes) != 0 {
+		t.Fatalf("invalidation must not emit new transitions, got %+v", newOnes)
+	}
+	if got := m2.Events(); len(got) != 0 {
+		t.Fatalf("invalidated firing must be removed from history, got %+v", got)
+	}
+	if st, _ := m2.State("job-rw2", model.KindSLA); st != model.AlertStateOK {
+		t.Fatalf("state after invalidation = %s, want OK", st)
+	}
+	t.Logf("decision basis: moved firing replaced (seq renumbered), invalidated firing removed; histories match canonical replay")
 }

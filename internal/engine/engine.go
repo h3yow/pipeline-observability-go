@@ -110,8 +110,10 @@ func (e *Engine) BackfillEvent(ctx context.Context, env event.Envelope) ingest.R
 // UNKNOWN conclusions: they are recorded in the pending view, raise no
 // alerts and do not count towards alert debounce. When the missing event
 // later arrives (late delivery or explicit backfill), the next Evaluate
-// re-judges the run and replays the job's alert observations in canonical
-// order, so the outcome equals the never-lost path without duplicate alerts.
+// re-judges the run and rebuilds the job's alert history from the
+// canonical observation order, so the outcome — firing/recovery count,
+// order and correspondence — equals the never-lost path exactly, with no
+// duplicated or lingering alerts.
 func (e *Engine) Evaluate() ([]model.Conclusion, []alert.Transition, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -162,8 +164,12 @@ func (e *Engine) Evaluate() ([]model.Conclusion, []alert.Transition, error) {
 }
 
 // recomputeJobLocked replays the job's determinable observations (in
-// canonical run order) through both alert lifecycles and returns only the
-// transitions that have never been emitted before.
+// canonical run order) through both alert lifecycles. The alert manager
+// rebuilds each slot's history to exactly what the replay produces, so a
+// backfilled run that moves a firing point earlier/later — or invalidates
+// it entirely — rewrites the history to the never-lost outcome instead of
+// leaving stale or duplicate alerts behind. Only genuinely new
+// transitions are returned.
 func (e *Engine) recomputeJobLocked(jobID model.JobID) []alert.Transition {
 	recs := make([]evalRecord, 0, len(e.records))
 	for _, r := range e.records {

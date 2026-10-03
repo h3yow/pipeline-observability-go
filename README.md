@@ -67,7 +67,10 @@ Schema **v1**：
 
 水位是全局事件时间概念：`watermark = max(已接受事件的 OccurredAt) − allowLateness`。
 迟到窗口应配置为能覆盖一次运行的最大时间跨度（演示与测试使用 6h / 1h）；超出窗口
-的迟到数据被明确丢弃并给出 `LATE` 原因，而不是污染已关闭的 run。
+的迟到数据被明确丢弃并给出 `LATE` 原因，而不是污染已关闭的 run。注意：当窗口小于
+事件时间跨度时，乱序/并发到达下哪些事件被判 `LATE` 取决于到达先后（这是水位语义
+本身）；被丢事件一定记录在拒绝台账（`RejectedFor`）中、缺口原因标为 `DROPPED_LATE`，
+可经显式补数（第 5 节）恢复，恢复后结论与告警历史仍与从未丢失完全一致。
 
 ## 3. 新鲜度与 SLA 判定规则
 
@@ -142,13 +145,21 @@ page, next, err := e.PendingRuns("", 100)   // 第一页
   会被吸收（连续计数被后续 breach 清零）。
 - **恢复与再次触发明确区分**：恢复产生独立的 `RECOVERED` 告警并回到 OK；之后再次 breach
   会产生一条**新的、独立序号**的 FIRING 告警（Seq 不同，恢复告警中还记录被恢复告警的 Seq）。
+  `Alert.Seq` 是该 `(JobID, Kind)` **规范告警历史内的 1 基位置**（不是全局计数器）：
+  历史只增不减时序号稳定；补数改写历史时会重编号为规范位置（见下）。
 - **观测幂等**：`Observe(obsID, ...)` 以 runID+kind 作为观测 ID；同一条观测被重复投递
   （重试风暴）时返回首次结果，状态机不会被二次推进。
 - 引擎在 `Evaluate` 中按 **FinishedAt 事件时间顺序**喂观测，因此即使原始事件乱序、并发
   到达，告警看到的观测序列也是确定的。
-- **规范重放（canonical replay）**：引擎为每个 `(JobID, Kind)` 保存全部可判定运行的观测，
-  任何变化（新运行、补数解出的运行插入其规范位置）都会触发全量重放；迁移以
-  `(目标状态, 触发观测)` 为身份去重，已发出的告警绝不重复，重放结果与增量喂入完全一致。
+- **规范重放与历史重建（canonical replay & history rebuild）**：引擎为每个
+  `(JobID, Kind)` 保存全部可判定运行的观测，任何变化（新运行、补数解出的运行插入其
+  规范位置）都会触发全量重放，并把该槽位的告警历史**重建**为重放结果：
+  - 重放仍产生的迁移（以「目标状态 + 触发观测」为身份）保留，不重复告警；
+  - 重放不再产生的迁移——补数使触发点前移/后移，或让原本触发的告警不再成立——
+    **从历史中移除**，不会留下「状态已正常、历史里还挂着一条触发」或同一告警触发两遍；
+  - Seq 重编号为规范位置，恢复告警引用的触发序号随之对齐。
+  因此历史（条数、先后顺序、恢复对应哪次触发）与「事件从未丢失、按正常顺序到达」
+  **逐条一致**。
 
 ## 5. 补数（backfill）：把找回的事件显式补进运行
 
@@ -167,9 +178,15 @@ conclusions, alerts, _ := e.Evaluate()           // 该运行得到确定性结�
   （该 run 已有同阶段事件时保留先到者，不覆盖）；
 - **幂等**：重复补数 / 并发补数同一 `EventID` 只生效一次，其余返回 `DUPLICATE`，
   不产生重复状态或重复告警；补数事件**不推进水位**（历史数据不重开迟到窗口）；
-- **结果等价**：聚合由事件集合规范重建，告警按规范序列重放，因此补数后的结论与
-  告警历史同"事件从未丢失、按正常顺序到达"**完全一致**（见
-  `TestBackfillEqualsNeverLostPath`）；
+- **结果等价——告警历史重建**：聚合由事件集合规范重建，告警历史由规范观测序列
+  重放后**整体重建**：补数若让首次触发告警的运行前移、后移，或让原本触发的告警
+  不再成立，历史都会被改写为「从未丢失」路径的结果——被取代/失效的触发与恢复
+  从 `AlertEvents()` 中移除，只保留规范重放仍然产生的迁移，Seq 重编号为规范位置。
+  因此补数后的结论与告警历史（条数、先后顺序、恢复对应哪次触发）同"事件从未丢失、
+  按正常顺序到达"**逐条一致**（见 `TestBackfillEqualsNeverLostPath`、
+  `TestBackfillMovesFiringEarlierEqualsNeverLost`、
+  `TestBackfillMovesFiringLaterEqualsNeverLost`、
+  `TestBackfillInvalidatesFiringEqualsNeverLost`）；
 - **版本钉住**：补数的运行仍按该 job 绑定的规则版本判定；旧版本规则下的历史结论
   可原样复现（见 `TestBackfillUnderPinnedHistoricalVersion`）。
 
@@ -186,6 +203,9 @@ go vet ./...
 
 # 全部单测（含竞态检测）
 go test ./... -race
+
+# 稳定性验证：重复多轮 + 随机用例顺序，必须持续全绿
+go test ./... -race -count=20 -shuffle=on
 
 # 查看输入事件与判定依据（测试日志会打印 INPUT 事件、DECISION、decision basis）
 go test ./... -race -v
@@ -210,10 +230,16 @@ go run ./cmd/demo
 - **时间基准不全**：缺 started 的运行判 UNKNOWN、不告警、不计数，完整运行不受影响；
   缺口原因可解释（NOT_ARRIVED / DROPPED_LATE / SUPERSEDED / DROPPED_INVALID）；
   待补全视图稳定分页（`TestUnknownRunNoMisjudgmentNoAlert`、`TestPendingViewPagination`）。
-- **补数**：被水位丢弃的事件可显式补回；补数后结论与告警历史和"从未丢失"路径一致；
-  重复 / 并发补数幂等；迟到窗口内的晚到事件无需补数即可自动解出
-  （`TestBackfillAfterLateDrop`、`TestBackfillEqualsNeverLostPath`、
-  `TestConcurrentBackfillAndEvaluateStable`、`TestLateArrivalResolvesPendingWithoutBackfill`）。
+- **补数**：被水位丢弃的事件可显式补回；补数后结论与告警历史和"从未丢失"路径
+  **逐条一致**——覆盖触发点前移、后移、以及告警被补数判定为不该存在（历史中的
+  失效触发被移除）三种改写（`TestBackfillEqualsNeverLostPath`、
+  `TestBackfillMovesFiringEarlierEqualsNeverLost`、
+  `TestBackfillMovesFiringLaterEqualsNeverLost`、
+  `TestBackfillInvalidatesFiringEqualsNeverLost`、告警层
+  `TestRecomputeRewritesSupersededHistory`）；重复 / 并发补数与并发重新判定
+  幂等，只产生一份结论、一条触发；迟到窗口内的晚到事件无需补数即可自动解出
+  （`TestConcurrentBackfillAndEvaluateStable`、`TestLateDropThenBackfill`、
+  `TestLateArrivalResolvesPendingWithoutBackfill`）。
 - **阈值抖动**：连续计数防抖，边界反复不产生重复告警；恢复与再次触发各自一条、序号不同。
 - **版本化复现**：规则 v1→v2 收紧后，v1 历史结论不变，v2 产生新结论；
   未知版本 / 缺失字段一律显式报错；补数的运行仍按钉住版本判定

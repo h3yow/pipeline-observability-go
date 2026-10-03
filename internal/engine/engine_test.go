@@ -492,10 +492,24 @@ func TestLateDropThenBackfill(t *testing.T) {
 	fin := finished("l-f1", runTime(d, 9, 5), "run-1", "job-a", "SUCCESS")
 	e.IngestEvent(context.Background(), fin)
 	// A much later run advances the watermark far beyond run-1's start.
-	feedShuffledConcurrent(t, e, []event.Envelope{
+	// NOTE: these two events are ingested sequentially, NOT via the
+	// shuffled/concurrent helper: the 1m lateness window is smaller than
+	// the 5m start->finish span, so under concurrent delivery the finish
+	// could win the race, push the watermark past the start and get it
+	// dropped as LATE — the accepted set would depend on goroutine
+	// scheduling. Watermark advancement is setup, not the subject of this
+	// test, so it must be deterministic.
+	for _, ev := range []event.Envelope{
 		started("l-s9", runTime(d, 20, 0), "run-9", "job-a"),
 		finished("l-f9", runTime(d, 20, 5), "run-9", "job-a", "SUCCESS"),
-	}, 0)
+	} {
+		r := e.IngestEvent(context.Background(), ev)
+		t.Logf("INPUT id=%s run=%s type=%s at=%s => %s", ev.EventID, ev.RunID, ev.Type,
+			ev.OccurredAt.Format("15:04"), r.Disposition)
+		if !r.Accepted {
+			t.Fatalf("watermark-advancing event %s must be accepted, got %s (%s)", ev.EventID, r.Disposition, r.Reason)
+		}
+	}
 	// The lost start now arrives and is dropped LATE.
 	lateStart := started("l-s1", runTime(d, 9, 0), "run-1", "job-a")
 	r1 := e.IngestEvent(context.Background(), lateStart)
@@ -812,4 +826,254 @@ func TestBackfillUnderPinnedHistoricalVersion(t *testing.T) {
 		t.Fatalf("historical v1 conclusion not reproducible: %s vs %s", first, second)
 	}
 	t.Logf("decision basis: pinned v1 governs backfilled runs; v2 registered later has no effect; replay stable (%s)", first)
+}
+
+// backfillScenario is one lost-started-event scenario: the full event set
+// (never-lost reference) plus the id of the started event that engine A
+// misses at first and later backfills.
+type backfillScenario struct {
+	name      string
+	lostID    string
+	fullSet   []event.Envelope
+	lostEvent event.Envelope
+}
+
+// moveEarlierScenario: run-2's start is lost. Without it, breaches of
+// run-1 and run-3 fire the SLA alert at run-3 and run-4 recovers it.
+// The backfilled run-2 is itself a breach finishing BEFORE run-3, so the
+// canonical firing point moves earlier: FIRE must end up attached to
+// run-2 exactly once, and the recovery must reference that firing.
+func moveEarlierScenario() backfillScenario {
+	d := 28
+	return backfillScenario{
+		name:   "firing point moves earlier",
+		lostID: "me-s2",
+		fullSet: []event.Envelope{
+			started("me-s1", runTime(d, 9, 0), "run-1", "job-a"),
+			finished("me-f1", runTime(d, 9, 20), "run-1", "job-a", "FAILED"), // breach #1
+			started("me-s2", runTime(d, 10, 0), "run-2", "job-a"),
+			finished("me-f2", runTime(d, 10, 15), "run-2", "job-a", "FAILED"), // breach, finishes before run-3
+			started("me-s3", runTime(d, 11, 0), "run-3", "job-a"),
+			finished("me-f3", runTime(d, 11, 20), "run-3", "job-a", "FAILED"), // breach
+			started("me-s4", runTime(d, 12, 0), "run-4", "job-a"),
+			finished("me-f4", runTime(d, 12, 5), "run-4", "job-a", "SUCCESS"), // pass -> recover
+		},
+		lostEvent: started("me-s2", runTime(d, 10, 0), "run-2", "job-a"),
+	}
+}
+
+// moveLaterScenario: run-m's start is lost. Without it, run-1+run-2
+// breach consecutively and fire at run-2. The backfilled run-m is a PASS
+// finishing between run-1 and run-2: it resets the debounce, so the
+// firing point moves later to run-3.
+func moveLaterScenario() backfillScenario {
+	d := 29
+	return backfillScenario{
+		name:   "firing point moves later",
+		lostID: "ml-sm",
+		fullSet: []event.Envelope{
+			started("ml-s1", runTime(d, 9, 0), "run-1", "job-a"),
+			finished("ml-f1", runTime(d, 9, 20), "run-1", "job-a", "FAILED"), // breach
+			started("ml-sm", runTime(d, 9, 25), "run-m", "job-a"),
+			finished("ml-fm", runTime(d, 9, 30), "run-m", "job-a", "SUCCESS"), // pass, resets debounce
+			started("ml-s2", runTime(d, 10, 0), "run-2", "job-a"),
+			finished("ml-f2", runTime(d, 10, 20), "run-2", "job-a", "FAILED"), // breach #1 after reset
+			started("ml-s3", runTime(d, 11, 0), "run-3", "job-a"),
+			finished("ml-f3", runTime(d, 11, 20), "run-3", "job-a", "FAILED"), // breach #2 => canonical fire
+		},
+		lostEvent: started("ml-sm", runTime(d, 9, 25), "run-m", "job-a"),
+	}
+}
+
+// disappearScenario: like moveLaterScenario but without run-3 — after the
+// backfilled pass resets the debounce, no firing remains at all. The
+// previously emitted FIRE must vanish from the alert history.
+func disappearScenario() backfillScenario {
+	d := 30
+	return backfillScenario{
+		name:   "firing disappears",
+		lostID: "di-sm",
+		fullSet: []event.Envelope{
+			started("di-s1", runTime(d, 9, 0), "run-1", "job-a"),
+			finished("di-f1", runTime(d, 9, 20), "run-1", "job-a", "FAILED"), // breach
+			started("di-sm", runTime(d, 9, 25), "run-m", "job-a"),
+			finished("di-fm", runTime(d, 9, 30), "run-m", "job-a", "SUCCESS"), // pass, resets debounce
+			started("di-s2", runTime(d, 10, 0), "run-2", "job-a"),
+			finished("di-f2", runTime(d, 10, 20), "run-2", "job-a", "FAILED"), // lone breach: no fire
+		},
+		lostEvent: started("di-sm", runTime(d, 9, 25), "run-m", "job-a"),
+	}
+}
+
+// runBackfillVsNeverLost executes the scenario both ways and returns the
+// two engines: A lost the started event and got it back via backfill,
+// ref never lost it. Both are fully evaluated and settled.
+func runBackfillVsNeverLost(t *testing.T, sc backfillScenario) (a, ref *Engine) {
+	t.Helper()
+
+	// Reference path: nothing lost, everything delivered (shuffled,
+	// duplicated, concurrent), evaluated in one shot.
+	ref = New(latenessWindow)
+	registerV1(t, ref)
+	feedShuffledConcurrent(t, ref, sc.fullSet, 1)
+	if _, _, err := ref.Evaluate(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Backfill path: the started event is missing at first.
+	a = New(latenessWindow)
+	registerV1(t, a)
+	var partial []event.Envelope
+	for _, ev := range sc.fullSet {
+		if ev.EventID != sc.lostID {
+			partial = append(partial, ev)
+		}
+	}
+	t.Logf("scenario %q: feeding %d events without %s (shuffled+duplicated+concurrent)",
+		sc.name, len(partial), sc.lostID)
+	feedShuffledConcurrent(t, a, partial, 1)
+	_, firstTrans, err := a.Evaluate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("before backfill: alert history = %s", transitionSeq(a.AlertEvents()))
+	for _, tr := range firstTrans {
+		t.Logf("ALERT before backfill %s job=%s %s->%s seq=%d reason=%q",
+			tr.Alert.Kind, tr.Alert.JobID, tr.FromState, tr.ToState, tr.Alert.Seq, tr.Alert.Reason)
+	}
+
+	// Backfill the recovered started event, twice concurrently: exactly
+	// one application, the duplicate is a no-op.
+	lost := sc.lostEvent
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	var mu sync.Mutex
+	disps := map[string]int{}
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r := a.BackfillEvent(context.Background(), lost)
+			mu.Lock()
+			disps[string(r.Disposition)]++
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	t.Logf("BACKFILL id=%s run=%s at=%s dispositions=%v",
+		lost.EventID, lost.RunID, lost.OccurredAt.Format("15:04"), disps)
+	if disps["BACKFILLED"] != 1 || disps["DUPLICATE"] != 1 {
+		t.Fatalf("backfill must apply exactly once, got %v", disps)
+	}
+
+	_, secondTrans, err := a.Evaluate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tr := range secondTrans {
+		t.Logf("ALERT after backfill %s job=%s %s->%s seq=%d reason=%q",
+			tr.Alert.Kind, tr.Alert.JobID, tr.FromState, tr.ToState, tr.Alert.Seq, tr.Alert.Reason)
+	}
+	t.Logf("after backfill: alert history = %s", transitionSeq(a.AlertEvents()))
+	return a, ref
+}
+
+// assertAlertHistoryEqualsNeverLost compares the whole alert history of
+// the backfilled engine with the never-lost reference, entry by entry
+// (kind, direction, reason — including the fire seq a recovery refers
+// to —, evidence, timestamp).
+func assertAlertHistoryEqualsNeverLost(t *testing.T, a, ref *Engine) {
+	t.Helper()
+	got, want := transitionCanon(a.AlertEvents()), transitionCanon(ref.AlertEvents())
+	if got != want {
+		t.Fatalf("alert history differs from never-lost path:\nbackfilled:\n%s\nreference:\n%s", got, want)
+	}
+	// Seq positions must match the reference exactly as well.
+	aEvs, refEvs := a.AlertEvents(), ref.AlertEvents()
+	for i := range aEvs {
+		if aEvs[i].Alert.Seq != refEvs[i].Alert.Seq {
+			t.Fatalf("entry %d seq=%d, reference seq=%d", i, aEvs[i].Alert.Seq, refEvs[i].Alert.Seq)
+		}
+	}
+	t.Logf("decision basis: alert history identical to never-lost path:\n%s", got)
+}
+
+// TestBackfillMovesFiringEarlierEqualsNeverLost: the alert fires before
+// the backfill (at run-3); the backfilled run-2 is an earlier breach and
+// becomes the canonical firing point. The history must end up with ONE
+// firing (attached to run-2) and ONE recovery referencing it — identical
+// to the path where run-2's start was never lost.
+func TestBackfillMovesFiringEarlierEqualsNeverLost(t *testing.T) {
+	a, ref := runBackfillVsNeverLost(t, moveEarlierScenario())
+
+	// Sanity of the reference: single FIRE (at run-2) + single RECOVER.
+	refEvs := ref.AlertEvents()
+	if len(refEvs) != 2 || refEvs[0].ToState != model.AlertStateFiring ||
+		refEvs[1].ToState != model.AlertStateRecover {
+		t.Fatalf("reference history wrong: %s", transitionSeq(refEvs))
+	}
+	assertAlertHistoryEqualsNeverLost(t, a, ref)
+
+	// Exactly one firing in A's history, triggered at run-2's finish time.
+	var fires int
+	for _, tr := range a.AlertEvents() {
+		if tr.ToState == model.AlertStateFiring {
+			fires++
+			if !tr.Alert.Timestamp.Equal(runTime(28, 10, 15)) {
+				t.Fatalf("firing must be stamped at run-2's finish (10:15), got %s",
+					tr.Alert.Timestamp.Format("15:04"))
+			}
+		}
+	}
+	if fires != 1 {
+		t.Fatalf("exactly one firing expected, got %d: %s", fires, transitionSeq(a.AlertEvents()))
+	}
+	if st, _ := a.AlertState("job-a", model.KindSLA); st != model.AlertStateOK {
+		t.Fatalf("final state = %s, want OK", st)
+	}
+}
+
+// TestBackfillMovesFiringLaterEqualsNeverLost: the alert fires before the
+// backfill (at run-2); the backfilled run-m is a pass that resets the
+// debounce, so the canonical firing point moves later to run-3. The stale
+// firing at run-2 must be replaced, not duplicated.
+func TestBackfillMovesFiringLaterEqualsNeverLost(t *testing.T) {
+	a, ref := runBackfillVsNeverLost(t, moveLaterScenario())
+
+	refEvs := ref.AlertEvents()
+	if len(refEvs) != 1 || refEvs[0].ToState != model.AlertStateFiring {
+		t.Fatalf("reference history wrong: %s", transitionSeq(refEvs))
+	}
+	assertAlertHistoryEqualsNeverLost(t, a, ref)
+
+	aEvs := a.AlertEvents()
+	if len(aEvs) != 1 || !aEvs[0].Alert.Timestamp.Equal(runTime(29, 11, 20)) {
+		t.Fatalf("single firing stamped at run-3's finish (11:20) expected, got %s", transitionSeq(aEvs))
+	}
+	if st, _ := a.AlertState("job-a", model.KindSLA); st != model.AlertStateFiring {
+		t.Fatalf("final state = %s, want FIRING", st)
+	}
+}
+
+// TestBackfillInvalidatesFiringEqualsNeverLost: the alert fires before
+// the backfill (at run-2); the backfilled pass breaks the breach streak
+// so no firing may remain. The history must not keep a stale trigger
+// while the state is back to normal.
+func TestBackfillInvalidatesFiringEqualsNeverLost(t *testing.T) {
+	sc := disappearScenario()
+	a, ref := runBackfillVsNeverLost(t, sc)
+
+	if got := len(ref.AlertEvents()); got != 0 {
+		t.Fatalf("reference must have no alerts, got %s", transitionSeq(ref.AlertEvents()))
+	}
+	assertAlertHistoryEqualsNeverLost(t, a, ref)
+	if got := a.AlertEvents(); len(got) != 0 {
+		t.Fatalf("invalidated firing must vanish from history, got %s", transitionSeq(got))
+	}
+	if st, _ := a.AlertState("job-a", model.KindSLA); st != model.AlertStateOK {
+		t.Fatalf("final state = %s, want OK", st)
+	}
+	t.Logf("decision basis: stale FIRE removed; state OK and empty history match the never-lost path")
 }
