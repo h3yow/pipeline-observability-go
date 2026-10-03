@@ -490,12 +490,27 @@ func TestLateDropThenBackfill(t *testing.T) {
 
 	// run-1's finish applies while the watermark is still low.
 	fin := finished("l-f1", runTime(d, 9, 5), "run-1", "job-a", "SUCCESS")
-	e.IngestEvent(context.Background(), fin)
-	// A much later run advances the watermark far beyond run-1's start.
-	feedShuffledConcurrent(t, e, []event.Envelope{
+	if rec := e.IngestEvent(context.Background(), fin); !rec.Accepted {
+		t.Fatalf("run-1 finish must be accepted, got %s", rec.Disposition)
+	}
+	t.Logf("INPUT l-f1 at=%s type=%s run=run-1 => APPLIED", runTime(d, 9, 5).Format("15:04"), event.TypeFinished)
+	// A much later run advances the watermark far beyond run-1's start. Feed
+	// start-before-finish SEQUENTIALLY on purpose: this pair only exists to
+	// move the watermark, and feeding it concurrently would make its own
+	// acceptance race the (advancing) watermark — non-deterministic and
+	// unrelated to the late-drop behavior under test.
+	for _, ev := range []event.Envelope{
 		started("l-s9", runTime(d, 20, 0), "run-9", "job-a"),
 		finished("l-f9", runTime(d, 20, 5), "run-9", "job-a", "SUCCESS"),
-	}, 0)
+	} {
+		rec := e.IngestEvent(context.Background(), ev)
+		t.Logf("INPUT %s at=%s type=%s run=%s => %s", ev.EventID,
+			ev.OccurredAt.Format("15:04"), ev.Type, ev.RunID, rec.Disposition)
+		if !rec.Accepted {
+			t.Fatalf("watermark-advancing event %s must be accepted, got %s (%s)",
+				ev.EventID, rec.Disposition, rec.Reason)
+		}
+	}
 	// The lost start now arrives and is dropped LATE.
 	lateStart := started("l-s1", runTime(d, 9, 0), "run-1", "job-a")
 	r1 := e.IngestEvent(context.Background(), lateStart)

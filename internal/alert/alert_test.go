@@ -2,6 +2,7 @@ package alert
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -240,4 +241,127 @@ func TestRecomputeInsertBackfilledObservation(t *testing.T) {
 		t.Fatalf("replay must be idempotent, got %d new transitions", len(third))
 	}
 	t.Logf("decision basis: canonical replay after backfill emits exactly FIRE+RECOVER once")
+}
+
+// o is shorthand for a FireAfterN=2 / RecoverAfterN=1 observation.
+func o(id string, breach bool, at int64) Observation {
+	return Observation{ObsID: id, Breach: breach, RuleVer: 1, FireAfterN: 2, RecoverAfterN: 1, At: at, Evidence: "ev " + id}
+}
+
+// TestRecomputeMovesFireEarlier: a missing breach, once inserted before the
+// current trigger, becomes the trigger itself; the history keeps ONE fire.
+func TestRecomputeMovesFireEarlier(t *testing.T) {
+	m := NewManager()
+	// run-2 unknown: breach(r1), breach(r3) => fire at r3; pass(r4) recovers.
+	first := m.Recompute("job-e", model.KindSLA, []Observation{
+		o("run-1:SLA", true, 100), o("run-3:SLA", true, 300), o("run-4:SLA", false, 400),
+	})
+	t.Logf("before backfill: %s", joinTransitions(first))
+	if len(first) != 2 || first[0].Alert.Timestamp.UnixNano() != 300 {
+		t.Fatalf("fire must start at run-3 (300), got %s", joinTransitions(first))
+	}
+	// Backfill run-2 as a breach at 200: fire moves earlier to run-2.
+	second := m.Recompute("job-e", model.KindSLA, []Observation{
+		o("run-1:SLA", true, 100), o("run-2:SLA", true, 200),
+		o("run-3:SLA", true, 300), o("run-4:SLA", false, 400),
+	})
+	t.Logf("after backfill NEW: %s", joinTransitions(second))
+	all := m.Events()
+	t.Logf("full history : %s", joinTransitions(all))
+	if len(all) != 2 {
+		t.Fatalf("history must hold one fire + one recovery, got %d", len(all))
+	}
+	if all[0].ToState != model.AlertStateFiring || all[0].Alert.Timestamp.UnixNano() != 200 {
+		t.Fatalf("fire must have moved to run-2 (200), got %s", joinTransitions(all))
+	}
+	if all[1].ToState != model.AlertStateRecover || all[1].Alert.Timestamp.UnixNano() != 400 {
+		t.Fatalf("recovery must stay at run-4 (400), got %s", joinTransitions(all))
+	}
+	// The recovery references the sole firing's seq.
+	if !strings.Contains(all[1].Alert.Reason, fmt.Sprintf("seq=%d", all[0].Alert.Seq)) {
+		t.Fatalf("recovery must close firing seq=%d, reason=%q", all[0].Alert.Seq, all[1].Alert.Reason)
+	}
+	st, _ := m.State("job-e", model.KindSLA)
+	if st != model.AlertStateOK {
+		t.Fatalf("state must be OK after recovery, got %s", st)
+	}
+}
+
+// TestRecomputeMovesFireLater: an inserted pass resets the debounce, pushing
+// the firing to a later streak.
+func TestRecomputeMovesFireLater(t *testing.T) {
+	m := NewManager()
+	// run-2 unknown: breach(r1), breach(r3), breach(r4), pass(r5)
+	// => fire at r3, recover at r5.
+	m.Recompute("job-l", model.KindSLA, []Observation{
+		o("run-1:SLA", true, 100), o("run-3:SLA", true, 300),
+		o("run-4:SLA", true, 400), o("run-5:SLA", false, 500),
+	})
+	// Insert pass run-2 at 200: breach, pass(reset), breach, breach => fire
+	// moves later to run-4; run-5 recovers.
+	got := m.Recompute("job-l", model.KindSLA, []Observation{
+		o("run-1:SLA", true, 100), o("run-2:SLA", false, 200),
+		o("run-3:SLA", true, 300), o("run-4:SLA", true, 400), o("run-5:SLA", false, 500),
+	})
+	all := m.Events()
+	t.Logf("post-backfill history: %s (newly returned: %s)", joinTransitions(all), joinTransitions(got))
+	if len(all) != 2 ||
+		all[0].ToState != model.AlertStateFiring || all[0].Alert.Timestamp.UnixNano() != 400 ||
+		all[1].ToState != model.AlertStateRecover || all[1].Alert.Timestamp.UnixNano() != 500 {
+		t.Fatalf("fire must move to run-4 (400), recovery at run-5, got %s", joinTransitions(all))
+	}
+}
+
+// TestRecomputeErasesFire: an inserted pass resets the only firing streak
+// away, so a previously emitted fire (and its recovery) vanish entirely.
+func TestRecomputeErasesFire(t *testing.T) {
+	m := NewManager()
+	// run-2 unknown: breach(r1), breach(r3) => fire; pass(r4) => recover.
+	before := m.Recompute("job-x", model.KindSLA, []Observation{
+		o("run-1:SLA", true, 100), o("run-3:SLA", true, 300), o("run-4:SLA", false, 400),
+	})
+	if len(before) != 2 {
+		t.Fatalf("precondition: fire+recover expected, got %d", len(before))
+	}
+	// Backfill run-2 as a pass at 200: breach, pass, breach => never fires.
+	m.Recompute("job-x", model.KindSLA, []Observation{
+		o("run-1:SLA", true, 100), o("run-2:SLA", false, 200),
+		o("run-3:SLA", true, 300), o("run-4:SLA", false, 400),
+	})
+	if all := m.Events(); len(all) != 0 {
+		t.Fatalf("history must be empty after the alert stops holding, got %s", joinTransitions(all))
+	}
+	if st, _ := m.State("job-x", model.KindSLA); st != model.AlertStateOK {
+		t.Fatalf("state must be OK, got %s", st)
+	}
+}
+
+// TestRecomputeDedupesObservations verifies duplicate/concurrent Recompute
+// feeds of the same ObsIDs produce one observation each and a stable log.
+func TestRecomputeDedupesObservations(t *testing.T) {
+	m := NewManager()
+	obs := []Observation{
+		o("run-1:SLA", true, 100), o("run-2:SLA", true, 200),
+		o("run-2:SLA", true, 200), o("run-1:SLA", true, 100),
+		o("run-3:SLA", false, 300),
+	}
+	tr := m.Recompute("job-d", model.KindSLA, obs)
+	if len(tr) != 2 {
+		t.Fatalf("deduplicated feed must fire once and recover once, got %s", joinTransitions(tr))
+	}
+	if again := m.Recompute("job-d", model.KindSLA, obs); len(again) != 0 {
+		t.Fatalf("identical recompute must return nothing new, got %d", len(again))
+	}
+	if len(m.Events()) != 2 {
+		t.Fatalf("log must stay at fire+recover, got %d", len(m.Events()))
+	}
+}
+
+func joinTransitions(ts []Transition) string {
+	out := ""
+	for _, tr := range ts {
+		out += fmt.Sprintf("%s:%s->%s#%d@%d ", tr.Alert.Kind, tr.FromState, tr.ToState,
+			tr.Alert.Seq, tr.Alert.Timestamp.UnixNano())
+	}
+	return "[" + out + "]"
 }
